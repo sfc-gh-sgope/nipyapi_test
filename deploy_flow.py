@@ -350,51 +350,115 @@ def apply_parameters(pg_id, params_dict):
 # ──────────────────────────────────────────────
 
 def upload_assets(pg_id, assets_list):
-    """Download asset files and upload them to the flow's parameter contexts."""
+    """Download asset files, upload them, and bind to parameters (nifihub pattern)."""
     if not assets_list:
         return
 
     print("\nUploading %d asset(s)..." % len(assets_list))
-    context_ids = _find_parameter_contexts(pg_id)
     pc_api = nipyapi.nifi.ParameterContextsApi()
 
-    # Build a map of parameter_name -> context_id
-    param_to_ctx = {}
-    for ctx_id in context_ids:
-        ctx_entity = pc_api.get_parameter_context(ctx_id, include_inherited_parameters=False)
-        for p in (ctx_entity.component.parameters or []):
-            param_to_ctx[p.parameter.name] = ctx_id
+    # Build a map of parameter_name -> (context_id, param_dto) across all contexts
+    pg_entity = nipyapi.nifi.ProcessGroupsApi().get_process_group(pg_id)
+    pc_ref = pg_entity.component.parameter_context
+    if not pc_ref:
+        print("  WARNING: No parameter context on this process group — skipping assets", file=sys.stderr)
+        return
+
+    param_map = {}
+    seen_contexts = set()
+
+    def walk_contexts(cid):
+        if cid in seen_contexts:
+            return
+        seen_contexts.add(cid)
+        pc = pc_api.get_parameter_context(id=cid)
+        for p in (pc.component.parameters or []):
+            if p.parameter.name not in param_map:
+                param_map[p.parameter.name] = (cid, p.parameter)
+        for inherited in (pc.component.inherited_parameter_contexts or []):
+            walk_contexts(inherited.id)
+
+    walk_contexts(pc_ref.id)
 
     for asset_def in assets_list:
         asset_name = asset_def["name"]
         asset_url = asset_def["url"]
         asset_param = asset_def["parameter"]
 
-        if asset_param not in param_to_ctx:
+        if asset_param not in param_map:
             print("  WARNING: Parameter '%s' not found — skipping asset '%s'" % (asset_param, asset_name),
                   file=sys.stderr)
             continue
 
-        ctx_id = param_to_ctx[asset_param]
+        ctx_id, param_dto = param_map[asset_param]
 
-        # Download the asset file
-        print("  Downloading asset: %s" % asset_name)
-        resp = requests.get(asset_url, timeout=120)
-        resp.raise_for_status()
+        # Check if asset already exists
+        existing_assets = {}
+        result = pc_api.get_assets(context_id=ctx_id)
+        for ae in (result.assets or []):
+            existing_assets[ae.asset.name] = ae.asset
 
-        # Upload to the parameter context as an asset via NiFi REST API
-        print("  Uploading asset to parameter context...")
-        upload_url = "%s/parameter-contexts/%s/assets" % (nipyapi.config.nifi_config.host, ctx_id)
-        headers = {"Authorization": "Bearer " + SNOWFLAKE_PAT}
-        files = {"file": (asset_name, resp.content, "application/octet-stream")}
-        upload_resp = requests.post(upload_url, headers=headers, files=files, timeout=120)
-        if upload_resp.ok:
-            print("  Uploaded: %s -> parameter '%s'" % (asset_name, asset_param))
+        if asset_name in existing_assets and not existing_assets[asset_name].missing_content:
+            asset_id = existing_assets[asset_name].id
+            print("  Asset '%s' already exists (id=%s) — skipping upload" % (asset_name, asset_id))
         else:
-            print("  WARNING: Asset upload returned %d — upload the driver manually via the OpenFlow canvas UI." % upload_resp.status_code)
-            print("  Asset saved locally: ./%s" % asset_name)
-            with open(os.path.join(os.path.dirname(__file__), asset_name), "wb") as f:
-                f.write(resp.content)
+            # Download the asset file
+            print("  Downloading: %s" % asset_name)
+            resp = requests.get(asset_url, timeout=120, headers={"User-Agent": "nifihub-deploy/1.0"})
+            resp.raise_for_status()
+            print("  Downloaded %d bytes" % len(resp.content))
+
+            # Upload using nipyapi: create_asset(body=bytes, context_id=id, filename=name)
+            print("  Uploading to parameter context...")
+            upload_result = pc_api.create_asset(body=resp.content, context_id=ctx_id, filename=asset_name)
+            asset_id = upload_result.asset.id
+            print("  Uploaded asset '%s' (id=%s)" % (asset_name, asset_id))
+
+        # Bind the asset to the parameter
+        print("  Binding parameter '%s' -> asset '%s'" % (asset_param, asset_name))
+        pc = pc_api.get_parameter_context(id=ctx_id)
+        current_params = {p.parameter.name: p.parameter for p in (pc.component.parameters or [])}
+
+        updated_params = []
+        for name, param in current_params.items():
+            if name == asset_param:
+                updated_params.append(nipyapi.nifi.ParameterEntity(
+                    parameter=nipyapi.nifi.ParameterDTO(
+                        name=name,
+                        sensitive=param.sensitive,
+                        description=param.description,
+                        referenced_assets=[
+                            nipyapi.nifi.AssetReferenceDTO(id=asset_id, name=asset_name)
+                        ],
+                    )
+                ))
+            else:
+                updated_params.append(nipyapi.nifi.ParameterEntity(parameter=param))
+
+        body = nipyapi.nifi.ParameterContextEntity(
+            id=ctx_id,
+            revision=pc.revision,
+            component=nipyapi.nifi.ParameterContextDTO(
+                id=ctx_id,
+                name=pc.component.name,
+                parameters=updated_params,
+            ),
+        )
+
+        req = pc_api.submit_parameter_context_update(context_id=ctx_id, body=body)
+        request_id = req.request.request_id
+
+        import time
+        while True:
+            time.sleep(1)
+            status = pc_api.get_parameter_context_update(context_id=ctx_id, request_id=request_id)
+            if status.request.complete:
+                if status.request.failure_reason:
+                    print("  ERROR: %s" % status.request.failure_reason, file=sys.stderr)
+                else:
+                    print("  Bound parameter '%s' to asset '%s'" % (asset_param, asset_name))
+                pc_api.delete_update_request(context_id=ctx_id, request_id=request_id)
+                break
 
 
 # ──────────────────────────────────────────────
