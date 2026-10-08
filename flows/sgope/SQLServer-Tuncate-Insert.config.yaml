@@ -8,7 +8,7 @@ parameters:
   SQLServer Username: "admin"
   SQLServer Password: "OPENFLOW_LOAD.PUBLIC.SQLSERVER_PWD"       # Resolved from Snowflake secret
   SQLServer Query Interval: "10 sec"
-  Included Table Names: "shantanu.msql_openflow.NRVA_Ascension_CIP,shantanu.msql_openflow.customers,shantanu.msql_openflow.products,shantanu.msql_openflow.categories,shantanu.msql_openflow.orders"
+  Included Table Names: "shantanu.msql_openflow.NRVA_Ascension_CIP,shantanu.msql_openflow.customers"
   Ingestion Type: "full"
 
   # --- Destination (Snowflake) ---
