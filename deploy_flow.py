@@ -143,7 +143,54 @@ def download_config_from_github(bucket, flow_name):
 
 
 # ──────────────────────────────────────────────
-# 4. Upload flow to OpenFlow runtime via nipyapi
+# 4. Resolve Snowflake secrets in config parameters
+# ──────────────────────────────────────────────
+
+# Pattern: DB.SCHEMA.SECRET_NAME (3 dot-separated parts, all uppercase/underscores)
+_SECRET_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def resolve_secrets(params_dict):
+    """Replace parameter values that look like Snowflake secret references with the actual secret value.
+
+    A secret reference is a fully qualified name like OPENFLOW_LOAD.PUBLIC.SQLSERVER_PWD.
+    The script connects to Snowflake, reads the secret, and substitutes the real value.
+    """
+    if not params_dict:
+        return params_dict
+
+    secrets_to_resolve = {k: v for k, v in params_dict.items() if isinstance(v, str) and _SECRET_PATTERN.match(v)}
+    if not secrets_to_resolve:
+        return params_dict
+
+    print("\nResolving %d secret(s) from Snowflake..." % len(secrets_to_resolve))
+    conn = snowflake.connector.connect(
+        account=SNOWFLAKE_ACCOUNT,
+        user=SNOWFLAKE_USER,
+        token=SNOWFLAKE_PAT,
+        authenticator="programmatic_access_token",
+        role=SNOWFLAKE_ROLE,
+    )
+    try:
+        cur = conn.cursor()
+        resolved = dict(params_dict)
+        for param_name, secret_ref in secrets_to_resolve.items():
+            print("  Resolving secret: %s -> %s" % (param_name, secret_ref))
+            cur.execute("SELECT SYSTEM$GET_SECRET_AS_PLAIN_TEXT('%s')" % secret_ref)
+            row = cur.fetchone()
+            if row and row[0]:
+                resolved[param_name] = row[0]
+                print("  Resolved: %s (value hidden)" % param_name)
+            else:
+                print("  WARNING: Could not resolve secret %s — keeping original value" % secret_ref,
+                      file=sys.stderr)
+        return resolved
+    finally:
+        conn.close()
+
+
+# ──────────────────────────────────────────────
+# 5. Upload flow to OpenFlow runtime via nipyapi
 # ──────────────────────────────────────────────
 
 def connect_to_runtime(runtime_url):
@@ -183,7 +230,7 @@ def deploy_flow_to_runtime(root_pg_id, flow_json, flow_name=None):
 
 
 # ──────────────────────────────────────────────
-# 5. Apply parameters from config.yaml
+# 6. Apply parameters from config.yaml
 # ──────────────────────────────────────────────
 
 def _find_parameter_contexts(pg_id):
@@ -265,7 +312,7 @@ def apply_parameters(pg_id, params_dict):
 
 
 # ──────────────────────────────────────────────
-# 6. Upload assets from config.yaml
+# 7. Upload assets from config.yaml
 # ──────────────────────────────────────────────
 
 def upload_assets(pg_id, assets_list):
@@ -309,7 +356,7 @@ def upload_assets(pg_id, assets_list):
 
 
 # ──────────────────────────────────────────────
-# 7. Main
+# 8. Main
 # ──────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -333,19 +380,23 @@ if __name__ == "__main__":
         if not args.skip_config:
             flow_config = download_config_from_github(args.bucket, args.flow)
 
-        # Step 4: Connect and deploy flow
+        # Step 4: Resolve secrets in config parameters
+        if flow_config and flow_config.get("parameters"):
+            flow_config["parameters"] = resolve_secrets(flow_config["parameters"])
+
+        # Step 5: Connect and deploy flow
         root_pg_id = connect_to_runtime(runtime_url)
         pg_id = deploy_flow_to_runtime(root_pg_id, flow_json, flow_name=args.name)
 
-        # Step 5: Apply parameters
+        # Step 6: Apply parameters
         if flow_config and flow_config.get("parameters"):
             apply_parameters(pg_id, flow_config["parameters"])
 
-        # Step 6: Upload assets
+        # Step 7: Upload assets
         if flow_config and flow_config.get("assets"):
             upload_assets(pg_id, flow_config["assets"])
 
-        # Step 7: Start the flow
+        # Step 8: Start the flow
         if args.start:
             print("\nStarting flow...")
             nipyapi.canvas.schedule_process_group(pg_id, True)
