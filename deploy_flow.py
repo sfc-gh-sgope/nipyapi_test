@@ -2,6 +2,8 @@
 """
 deploy_flow.py — Download a NiFi flow JSON from GitHub and upload it to an OpenFlow runtime.
 
+Optionally reads a companion .config.yaml to set parameters and upload assets (e.g. JDBC drivers).
+
 Usage:
     1. Fill in your .env file with your GitHub PAT, Snowflake account, and runtime details.
     2. Run:  python deploy_flow.py <bucket> <flow-name>
@@ -23,6 +25,7 @@ import uuid
 import nipyapi
 import requests
 import snowflake.connector
+import yaml
 from dotenv import load_dotenv
 
 # ──────────────────────────────────────────────
@@ -44,6 +47,8 @@ OPENFLOW_DATABASE = os.environ["OPENFLOW_DATABASE"].strip()
 OPENFLOW_SCHEMA = os.environ["OPENFLOW_SCHEMA"].strip()
 OPENFLOW_RUNTIME = os.environ["OPENFLOW_RUNTIME"].strip()
 USE_PRIVATELINK = os.environ.get("USE_PRIVATELINK", "false").strip().lower() == "true"
+
+GITHUB_HEADERS = {"Authorization": "Bearer " + GITHUB_PAT, "Accept": "application/vnd.github.v3+json"}
 
 
 # ──────────────────────────────────────────────
@@ -75,8 +80,6 @@ def resolve_runtime_url():
                 if status != "ACTIVE":
                     print("WARNING: Runtime is %s, not ACTIVE. Deploy may fail." % status, file=sys.stderr)
 
-                # Build the URL: https://of1--{account}.snowflakecomputing.app/{key}
-                # Account format: org-account (e.g. sfsenorthamerica-sgope_aws3)
                 cur.execute("SELECT LOWER(CURRENT_ORGANIZATION_NAME() || '-' || CURRENT_ACCOUNT_NAME())")
                 account_locator = cur.fetchone()[0].replace("_", "-")
                 domain = "privatelink.snowflakecomputing.app" if USE_PRIVATELINK else "snowflakecomputing.app"
@@ -93,48 +96,68 @@ def resolve_runtime_url():
 
 
 # ──────────────────────────────────────────────
-# 3. Download flow JSON from GitHub
+# 3. Download files from GitHub
 # ──────────────────────────────────────────────
+
+def _download_github_file(path):
+    """Download a file from GitHub and return its decoded content as a string."""
+    url = "https://api.github.com/repos/%s/contents/%s" % (GITHUB_REPO, path)
+    resp = requests.get(url, headers=GITHUB_HEADERS, params={"ref": GITHUB_BRANCH}, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    content_b64 = data.get("content", "")
+    if not content_b64:
+        raise ValueError("GitHub returned empty content for " + path)
+    return base64.b64decode(content_b64).decode("utf-8")
+
 
 def download_flow_from_github(bucket, flow_name):
     """Fetch a flow definition JSON from the GitHub repo and return it as a dict."""
     filename = flow_name if flow_name.endswith(".json") else flow_name + ".json"
     path = "%s/%s/%s" % (GITHUB_FLOWS_PATH.strip("/"), bucket, filename)
-    url = "https://api.github.com/repos/%s/contents/%s" % (GITHUB_REPO, path)
-
-    print("Downloading from GitHub: %s (branch: %s)" % (path, GITHUB_BRANCH))
-    resp = requests.get(
-        url,
-        headers={"Authorization": "Bearer " + GITHUB_PAT, "Accept": "application/vnd.github.v3+json"},
-        params={"ref": GITHUB_BRANCH},
-        timeout=30,
-    )
-    resp.raise_for_status()
-
-    data = resp.json()
-    content_b64 = data.get("content", "")
-    if not content_b64:
-        raise ValueError("GitHub returned empty content for " + path)
-
-    raw = base64.b64decode(content_b64).decode("utf-8")
-    flow_json = json.loads(raw)
+    print("Downloading flow from GitHub: %s (branch: %s)" % (path, GITHUB_BRANCH))
+    flow_json = json.loads(_download_github_file(path))
     print("Downloaded flow: %s" % flow_json.get("flowContents", {}).get("name", flow_name))
     return flow_json
+
+
+def download_config_from_github(bucket, flow_name):
+    """Fetch the optional .config.yaml for a flow. Returns a dict or None if not found."""
+    base_name = flow_name.removesuffix(".json")
+    config_filename = base_name + ".config.yaml"
+    path = "%s/%s/%s" % (GITHUB_FLOWS_PATH.strip("/"), bucket, config_filename)
+    try:
+        print("Looking for config: %s" % path)
+        raw = _download_github_file(path)
+        config = yaml.safe_load(raw)
+        print("Found config with %d parameters, %d assets" % (
+            len(config.get("parameters", {})),
+            len(config.get("assets", [])),
+        ))
+        return config
+    except requests.HTTPError as e:
+        if e.response.status_code == 404:
+            print("No config.yaml found — skipping parameters/assets")
+            return None
+        raise
 
 
 # ──────────────────────────────────────────────
 # 4. Upload flow to OpenFlow runtime via nipyapi
 # ──────────────────────────────────────────────
 
-def deploy_flow_to_runtime(runtime_url, flow_json, flow_name=None, start=False):
-    """Upload a flow JSON to the OpenFlow runtime and optionally start it."""
+def connect_to_runtime(runtime_url):
+    """Configure nipyapi and return the root process group ID."""
     base = re.sub(r"/nifi-api/?$", "", re.sub(r"/nifi/?$", "", runtime_url.rstrip("/")))
     nipyapi.config.nifi_config.host = base + "/nifi-api"
     nipyapi.security.set_service_auth_token(service="nifi", token=SNOWFLAKE_PAT)
-
     root_pg_id = nipyapi.canvas.get_root_pg_id()
     print("Connected to runtime. Root process group: %s" % root_pg_id)
+    return root_pg_id
 
+
+def deploy_flow_to_runtime(root_pg_id, flow_json, flow_name=None):
+    """Upload a flow JSON to the OpenFlow runtime. Returns the process group ID."""
     group_name = flow_name or flow_json.get("flowContents", {}).get("name", "Deployed Flow")
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
@@ -156,17 +179,137 @@ def deploy_flow_to_runtime(runtime_url, flow_json, flow_name=None, start=False):
 
     pg_id = result.id
     print("Deployed process group: %s (id: %s)" % (group_name, pg_id))
-
-    if start:
-        print("Starting flow...")
-        nipyapi.canvas.schedule_process_group(pg_id, True)
-        print("Flow started.")
-
     return pg_id
 
 
 # ──────────────────────────────────────────────
-# 5. Main
+# 5. Apply parameters from config.yaml
+# ──────────────────────────────────────────────
+
+def _find_parameter_contexts(pg_id):
+    """Find all parameter context IDs associated with a process group (recursively)."""
+    context_ids = set()
+    pg_entity = nipyapi.nifi.ProcessGroupsApi().get_process_group(pg_id)
+    ctx_ref = pg_entity.component.parameter_context
+    if ctx_ref and ctx_ref.id:
+        context_ids.add(ctx_ref.id)
+
+    flow_dto = nipyapi.nifi.FlowApi().get_flow(pg_id)
+    for child_pg in (flow_dto.process_group_flow.flow.process_groups or []):
+        context_ids.update(_find_parameter_contexts(child_pg.id))
+
+    return context_ids
+
+
+def apply_parameters(pg_id, params_dict):
+    """Set parameter values on the flow's parameter contexts."""
+    if not params_dict:
+        return
+
+    print("\nApplying %d parameters..." % len(params_dict))
+    context_ids = _find_parameter_contexts(pg_id)
+    if not context_ids:
+        print("WARNING: No parameter contexts found on this process group", file=sys.stderr)
+        return
+
+    params_applied = set()
+    pc_api = nipyapi.nifi.ParameterContextsApi()
+
+    for ctx_id in context_ids:
+        ctx_entity = pc_api.get_parameter_context(ctx_id, include_inherited_parameters=False)
+        ctx_name = ctx_entity.component.name
+        existing_params = {p.parameter.name: p for p in (ctx_entity.component.parameters or [])}
+
+        updates = []
+        for param_name, param_value in params_dict.items():
+            if param_name in existing_params:
+                updates.append({
+                    "parameter": {
+                        "name": param_name,
+                        "value": str(param_value),
+                        "sensitive": existing_params[param_name].parameter.sensitive,
+                    }
+                })
+                params_applied.add(param_name)
+
+        if not updates:
+            continue
+
+        print("  Setting %d parameters on context '%s'" % (len(updates), ctx_name))
+        update_body = {
+            "revision": {"version": ctx_entity.revision.version},
+            "id": ctx_id,
+            "component": {
+                "id": ctx_id,
+                "parameters": updates,
+            },
+        }
+        update_request = pc_api.submit_parameter_context_update(ctx_id, update_body)
+
+        # Wait for the update to complete
+        request_id = update_request.request.request_id
+        while True:
+            status = pc_api.get_parameter_context_update(ctx_id, request_id)
+            if status.request.complete:
+                if status.request.failure_reason:
+                    print("  ERROR: %s" % status.request.failure_reason, file=sys.stderr)
+                else:
+                    print("  Done.")
+                pc_api.delete_update_request(ctx_id, request_id)
+                break
+
+    not_found = set(params_dict.keys()) - params_applied
+    if not_found:
+        print("WARNING: These parameters were not found in any context: %s" % ", ".join(sorted(not_found)),
+              file=sys.stderr)
+
+
+# ──────────────────────────────────────────────
+# 6. Upload assets from config.yaml
+# ──────────────────────────────────────────────
+
+def upload_assets(pg_id, assets_list):
+    """Download asset files and upload them to the flow's parameter contexts."""
+    if not assets_list:
+        return
+
+    print("\nUploading %d asset(s)..." % len(assets_list))
+    context_ids = _find_parameter_contexts(pg_id)
+    pc_api = nipyapi.nifi.ParameterContextsApi()
+
+    # Build a map of parameter_name -> context_id
+    param_to_ctx = {}
+    for ctx_id in context_ids:
+        ctx_entity = pc_api.get_parameter_context(ctx_id, include_inherited_parameters=False)
+        for p in (ctx_entity.component.parameters or []):
+            param_to_ctx[p.parameter.name] = ctx_id
+
+    for asset_def in assets_list:
+        asset_name = asset_def["name"]
+        asset_url = asset_def["url"]
+        asset_param = asset_def["parameter"]
+
+        if asset_param not in param_to_ctx:
+            print("  WARNING: Parameter '%s' not found — skipping asset '%s'" % (asset_param, asset_name),
+                  file=sys.stderr)
+            continue
+
+        ctx_id = param_to_ctx[asset_param]
+
+        # Download the asset file
+        print("  Downloading asset: %s" % asset_name)
+        resp = requests.get(asset_url, timeout=120)
+        resp.raise_for_status()
+
+        # Upload to the parameter context as an asset
+        print("  Uploading asset to parameter context...")
+        file_tuple = (asset_name, resp.content, "application/octet-stream")
+        pc_api.create_assets(id=ctx_id, file=file_tuple)
+        print("  Uploaded: %s -> parameter '%s'" % (asset_name, asset_param))
+
+
+# ──────────────────────────────────────────────
+# 7. Main
 # ──────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -175,13 +318,41 @@ if __name__ == "__main__":
     parser.add_argument("flow", help="Flow name without .json (e.g. 'Snowflake-to-Postgres')")
     parser.add_argument("--name", default=None, help="Override the process group name")
     parser.add_argument("--start", action="store_true", help="Start the flow after deploying")
+    parser.add_argument("--skip-config", action="store_true", help="Skip loading config.yaml (no params/assets)")
     args = parser.parse_args()
 
     try:
+        # Step 1: Resolve runtime URL
         runtime_url = resolve_runtime_url()
+
+        # Step 2: Download flow JSON from GitHub
         flow_json = download_flow_from_github(args.bucket, args.flow)
-        pg_id = deploy_flow_to_runtime(runtime_url, flow_json, flow_name=args.name, start=args.start)
+
+        # Step 3: Download config YAML from GitHub (optional)
+        flow_config = None
+        if not args.skip_config:
+            flow_config = download_config_from_github(args.bucket, args.flow)
+
+        # Step 4: Connect and deploy flow
+        root_pg_id = connect_to_runtime(runtime_url)
+        pg_id = deploy_flow_to_runtime(root_pg_id, flow_json, flow_name=args.name)
+
+        # Step 5: Apply parameters
+        if flow_config and flow_config.get("parameters"):
+            apply_parameters(pg_id, flow_config["parameters"])
+
+        # Step 6: Upload assets
+        if flow_config and flow_config.get("assets"):
+            upload_assets(pg_id, flow_config["assets"])
+
+        # Step 7: Start the flow
+        if args.start:
+            print("\nStarting flow...")
+            nipyapi.canvas.schedule_process_group(pg_id, True)
+            print("Flow started.")
+
         print("\nDone! Process group ID: %s" % pg_id)
+
     except requests.HTTPError as e:
         print("GitHub API error: %s" % e, file=sys.stderr)
         sys.exit(1)
