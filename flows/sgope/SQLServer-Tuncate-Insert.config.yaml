@@ -6,7 +6,7 @@ parameters:
   # --- Source (SQLServer) ---
   SQLServer Connection URL: "jdbc:sqlserver://shantanu-mssql-1.cfgog6egqv3o.us-east-1.rds.amazonaws.com:1433;encrypt=false"
   SQLServer Username: "admin"
-  SQLServer Password: "OPENFLOW_LOAD.PUBLIC.SQLSERVER_PWD"       # Resolved from Snowflake secret
+  SQLServer Password: "$SECRET{SQLSERVER_PWD}"                   # Resolved from .env variable SQLSERVER_PWD
   SQLServer Query Interval: "10 sec"
   Included Table Names: "shantanu.msql_openflow.NRVA_Ascension_CIP,shantanu.msql_openflow.customers"
   Ingestion Type: "full"

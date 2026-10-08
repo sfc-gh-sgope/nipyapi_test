@@ -143,50 +143,40 @@ def download_config_from_github(bucket, flow_name):
 
 
 # ──────────────────────────────────────────────
-# 4. Resolve Snowflake secrets in config parameters
+# 4. Resolve secrets in config parameters
 # ──────────────────────────────────────────────
 
-# Pattern: DB.SCHEMA.SECRET_NAME (3 dot-separated parts, all uppercase/underscores)
-_SECRET_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$")
+# Pattern: $SECRET{VAR_NAME} — resolved from .env / environment variables
+_SECRET_PATTERN = re.compile(r"^\$SECRET\{([^}]+)\}$")
 
 
 def resolve_secrets(params_dict):
-    """Replace parameter values that look like Snowflake secret references with the actual secret value.
+    """Replace $SECRET{VAR_NAME} values with the actual value from .env / environment.
 
-    A secret reference is a fully qualified name like OPENFLOW_LOAD.PUBLIC.SQLSERVER_PWD.
-    The script connects to Snowflake, reads the secret, and substitutes the real value.
+    In config.yaml:
+        SQLServer Password: "$SECRET{SQLSERVER_PWD}"
+
+    In .env:
+        SQLSERVER_PWD=Openflowdemo2025
     """
     if not params_dict:
         return params_dict
 
-    secrets_to_resolve = {k: v for k, v in params_dict.items() if isinstance(v, str) and _SECRET_PATTERN.match(v)}
-    if not secrets_to_resolve:
-        return params_dict
-
-    print("\nResolving %d secret(s) from Snowflake..." % len(secrets_to_resolve))
-    conn = snowflake.connector.connect(
-        account=SNOWFLAKE_ACCOUNT,
-        user=SNOWFLAKE_USER,
-        token=SNOWFLAKE_PAT,
-        authenticator="programmatic_access_token",
-        role=SNOWFLAKE_ROLE,
-    )
-    try:
-        cur = conn.cursor()
-        resolved = dict(params_dict)
-        for param_name, secret_ref in secrets_to_resolve.items():
-            print("  Resolving secret: %s -> %s" % (param_name, secret_ref))
-            cur.execute("SELECT SYSTEM$GET_SECRET_AS_PLAIN_TEXT('%s')" % secret_ref)
-            row = cur.fetchone()
-            if row and row[0]:
-                resolved[param_name] = row[0]
-                print("  Resolved: %s (value hidden)" % param_name)
+    resolved = dict(params_dict)
+    for param_name, param_value in params_dict.items():
+        if not isinstance(param_value, str):
+            continue
+        match = _SECRET_PATTERN.match(param_value)
+        if match:
+            env_var = match.group(1)
+            secret_value = os.environ.get(env_var, "").strip()
+            if secret_value:
+                resolved[param_name] = secret_value
+                print("  Resolved secret: %s from $SECRET{%s}" % (param_name, env_var))
             else:
-                print("  WARNING: Could not resolve secret %s — keeping original value" % secret_ref,
-                      file=sys.stderr)
-        return resolved
-    finally:
-        conn.close()
+                print("  WARNING: %s not found in .env — keeping placeholder" % env_var, file=sys.stderr)
+
+    return resolved
 
 
 # ──────────────────────────────────────────────
