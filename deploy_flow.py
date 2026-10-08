@@ -30,13 +30,13 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
-GITHUB_PAT = os.environ["GITHUB_PAT"]
-GITHUB_REPO = os.environ["GITHUB_REPO"]
-GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
-GITHUB_FLOWS_PATH = os.environ.get("GITHUB_FLOWS_PATH", "flows")
+GITHUB_PAT = os.environ["GITHUB_PAT"].strip()
+GITHUB_REPO = os.environ["GITHUB_REPO"].strip()
+GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip()
+GITHUB_FLOWS_PATH = os.environ.get("GITHUB_FLOWS_PATH", "flows").strip()
 
-SNOWFLAKE_RUNTIME_URL = os.environ["SNOWFLAKE_RUNTIME_URL"]
-SNOWFLAKE_RUNTIME_PAT = os.environ["SNOWFLAKE_RUNTIME_PAT"]
+SNOWFLAKE_RUNTIME_URL = os.environ["SNOWFLAKE_RUNTIME_URL"].strip()
+SNOWFLAKE_RUNTIME_PAT = os.environ["SNOWFLAKE_RUNTIME_PAT"].strip()
 
 
 # ──────────────────────────────────────────────
