@@ -1,0 +1,3 @@
+nipyapi
+requests
+python-dotenv
