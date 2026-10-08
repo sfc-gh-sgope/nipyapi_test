@@ -224,16 +224,40 @@ def deploy_flow_to_runtime(root_pg_id, flow_json, flow_name=None):
 # ──────────────────────────────────────────────
 
 def _find_parameter_contexts(pg_id):
-    """Find all parameter context IDs associated with a process group (recursively)."""
+    """Find all parameter context IDs associated with a process group, including inherited contexts."""
     context_ids = set()
+    pc_api = nipyapi.nifi.ParameterContextsApi()
+
     pg_entity = nipyapi.nifi.ProcessGroupsApi().get_process_group(pg_id)
     ctx_ref = pg_entity.component.parameter_context
     if ctx_ref and ctx_ref.id:
         context_ids.add(ctx_ref.id)
+        # Also include inherited contexts
+        ctx_full = pc_api.get_parameter_context(ctx_ref.id, include_inherited_parameters=False)
+        for inherited in (ctx_full.component.inherited_parameter_contexts or []):
+            context_ids.add(inherited.id)
 
+    # Check child process groups recursively
     flow_dto = nipyapi.nifi.FlowApi().get_flow(pg_id)
     for child_pg in (flow_dto.process_group_flow.flow.process_groups or []):
         context_ids.update(_find_parameter_contexts(child_pg.id))
+
+    # If we still have few contexts, scan all contexts on the runtime for ones matching the flow name
+    if len(context_ids) <= 1:
+        flow_name = pg_entity.component.name
+        headers = {"Authorization": "Bearer " + SNOWFLAKE_PAT}
+        resp = requests.get(
+            nipyapi.config.nifi_config.host + "/flow/parameter-contexts",
+            headers=headers, timeout=30,
+        )
+        if resp.ok:
+            for ctx in resp.json().get("parameterContexts", []):
+                ctx_name = ctx["component"]["name"]
+                # Match contexts that share a naming prefix with the flow
+                # e.g. flow "SQLServer DELINS" matches "SQLServer DELINS Source Para"
+                flow_prefix = flow_name.split(" - ")[0].split(" (")[0]
+                if ctx_name.startswith(flow_prefix) or flow_prefix.startswith(ctx_name.split(" ")[0]):
+                    context_ids.add(ctx["id"])
 
     return context_ids
 
@@ -273,26 +297,46 @@ def apply_parameters(pg_id, params_dict):
             continue
 
         print("  Setting %d parameters on context '%s'" % (len(updates), ctx_name))
-        update_body = {
+
+        # Use raw HTTP POST — nipyapi's model serialization has issues with this endpoint
+        api_client = nipyapi.nifi.ApiClient()
+        api_client.configuration = nipyapi.config.nifi_config
+        api_url = "%s/parameter-contexts/%s/update-requests" % (
+            nipyapi.config.nifi_config.host, ctx_id
+        )
+        body = json.dumps({
             "revision": {"version": ctx_entity.revision.version},
             "id": ctx_id,
             "component": {
                 "id": ctx_id,
                 "parameters": updates,
             },
+        })
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + SNOWFLAKE_PAT,
         }
-        update_request = pc_api.submit_parameter_context_update(ctx_id, update_body)
+        resp = requests.post(api_url, data=body, headers=headers, timeout=30, verify=True)
+        resp.raise_for_status()
+        request_id = resp.json()["request"]["requestId"]
 
         # Wait for the update to complete
-        request_id = update_request.request.request_id
         while True:
-            status = pc_api.get_parameter_context_update(ctx_id, request_id)
-            if status.request.complete:
-                if status.request.failure_reason:
-                    print("  ERROR: %s" % status.request.failure_reason, file=sys.stderr)
+            status_resp = requests.get(
+                "%s/parameter-contexts/%s/update-requests/%s" % (nipyapi.config.nifi_config.host, ctx_id, request_id),
+                headers=headers, timeout=30, verify=True,
+            )
+            status_data = status_resp.json()
+            if status_data["request"]["complete"]:
+                if status_data["request"].get("failureReason"):
+                    print("  ERROR: %s" % status_data["request"]["failureReason"], file=sys.stderr)
                 else:
                     print("  Done.")
-                pc_api.delete_update_request(ctx_id, request_id)
+                # Clean up the update request
+                requests.delete(
+                    "%s/parameter-contexts/%s/update-requests/%s" % (nipyapi.config.nifi_config.host, ctx_id, request_id),
+                    headers=headers, timeout=30, verify=True,
+                )
                 break
 
     not_found = set(params_dict.keys()) - params_applied
@@ -338,11 +382,19 @@ def upload_assets(pg_id, assets_list):
         resp = requests.get(asset_url, timeout=120)
         resp.raise_for_status()
 
-        # Upload to the parameter context as an asset
+        # Upload to the parameter context as an asset via NiFi REST API
         print("  Uploading asset to parameter context...")
-        file_tuple = (asset_name, resp.content, "application/octet-stream")
-        pc_api.create_assets(id=ctx_id, file=file_tuple)
-        print("  Uploaded: %s -> parameter '%s'" % (asset_name, asset_param))
+        upload_url = "%s/parameter-contexts/%s/assets" % (nipyapi.config.nifi_config.host, ctx_id)
+        headers = {"Authorization": "Bearer " + SNOWFLAKE_PAT}
+        files = {"file": (asset_name, resp.content, "application/octet-stream")}
+        upload_resp = requests.post(upload_url, headers=headers, files=files, timeout=120)
+        if upload_resp.ok:
+            print("  Uploaded: %s -> parameter '%s'" % (asset_name, asset_param))
+        else:
+            print("  WARNING: Asset upload returned %d — upload the driver manually via the OpenFlow canvas UI." % upload_resp.status_code)
+            print("  Asset saved locally: ./%s" % asset_name)
+            with open(os.path.join(os.path.dirname(__file__), asset_name), "wb") as f:
+                f.write(resp.content)
 
 
 # ──────────────────────────────────────────────
