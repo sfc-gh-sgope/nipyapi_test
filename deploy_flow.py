@@ -457,7 +457,45 @@ def upload_assets(pg_id, assets_list):
 
 
 # ──────────────────────────────────────────────
-# 8. Main
+# 8. List, start, and stop deployed flows
+# ──────────────────────────────────────────────
+
+def _get_runtime_name(args):
+    runtime_name = args.runtime or OPENFLOW_RUNTIME
+    if not runtime_name:
+        print("ERROR: No runtime specified. Use --runtime NAME or set OPENFLOW_RUNTIME in .env", file=sys.stderr)
+        sys.exit(1)
+    return runtime_name
+
+
+def _connect_to_named_runtime(runtime_name):
+    runtime_url = resolve_runtime_url(runtime_name)
+    connect_to_runtime(runtime_url)
+
+
+def _get_root_process_groups():
+    """Get all top-level process groups on the connected runtime."""
+    root_pg_id = nipyapi.canvas.get_root_pg_id()
+    flow = nipyapi.nifi.FlowApi().get_flow(root_pg_id)
+    return flow.process_group_flow.flow.process_groups or []
+
+
+def _find_pg_by_name(name):
+    """Find a process group by name on the runtime. Returns the PG entity or exits."""
+    pgs = _get_root_process_groups()
+    matches = [pg for pg in pgs if pg.component.name == name]
+    if not matches:
+        all_names = [pg.component.name for pg in pgs]
+        print("ERROR: Flow '%s' not found on this runtime." % name, file=sys.stderr)
+        print("Available flows: %s" % ", ".join(all_names), file=sys.stderr)
+        sys.exit(1)
+    if len(matches) > 1:
+        print("WARNING: Multiple flows named '%s' found — using the first one." % name, file=sys.stderr)
+    return matches[0]
+
+
+# ──────────────────────────────────────────────
+# 9. Command handlers
 # ──────────────────────────────────────────────
 
 def cmd_list_runtimes(args):
@@ -476,10 +514,7 @@ def cmd_list_runtimes(args):
 
 def cmd_deploy(args):
     """Deploy a flow from GitHub to an OpenFlow runtime."""
-    runtime_name = args.runtime or OPENFLOW_RUNTIME
-    if not runtime_name:
-        print("ERROR: No runtime specified. Use --runtime NAME or set OPENFLOW_RUNTIME in .env", file=sys.stderr)
-        sys.exit(1)
+    runtime_name = _get_runtime_name(args)
 
     # Step 1: Resolve runtime URL
     runtime_url = resolve_runtime_url(runtime_name)
@@ -517,6 +552,42 @@ def cmd_deploy(args):
     print("\nDone! Process group ID: %s" % pg_id)
 
 
+def cmd_list_flows(args):
+    """List all deployed flows (top-level process groups) on a runtime."""
+    _connect_to_named_runtime(_get_runtime_name(args))
+    pgs = _get_root_process_groups()
+    if not pgs:
+        print("No flows deployed on this runtime.")
+        return
+    print("%-40s %-40s %s" % ("NAME", "ID", "STATUS"))
+    print("-" * 100)
+    for pg in pgs:
+        status = pg.status.aggregate_snapshot
+        if status.active_thread_count and status.active_thread_count > 0:
+            state = "RUNNING"
+        else:
+            state = "STOPPED"
+        print("%-40s %-40s %s" % (pg.component.name, pg.id, state))
+
+
+def cmd_start(args):
+    """Start a deployed flow on a runtime."""
+    _connect_to_named_runtime(_get_runtime_name(args))
+    pg = _find_pg_by_name(args.flow_name)
+    print("Starting flow: %s (id: %s)" % (pg.component.name, pg.id))
+    nipyapi.canvas.schedule_process_group(pg.id, True)
+    print("Flow started.")
+
+
+def cmd_stop(args):
+    """Stop a deployed flow on a runtime."""
+    _connect_to_named_runtime(_get_runtime_name(args))
+    pg = _find_pg_by_name(args.flow_name)
+    print("Stopping flow: %s (id: %s)" % (pg.component.name, pg.id))
+    nipyapi.canvas.schedule_process_group(pg.id, False)
+    print("Flow stopped.")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Deploy NiFi flows from GitHub to OpenFlow runtimes")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -524,14 +595,28 @@ if __name__ == "__main__":
     # list-runtimes
     subparsers.add_parser("list-runtimes", help="List all available OpenFlow runtimes")
 
+    # list-flows
+    lf_parser = subparsers.add_parser("list-flows", help="List deployed flows on a runtime")
+    lf_parser.add_argument("--runtime", default=None, help="Runtime name (overrides .env default)")
+
     # deploy
     deploy_parser = subparsers.add_parser("deploy", help="Deploy a flow to an OpenFlow runtime")
     deploy_parser.add_argument("bucket", help="Flow bucket directory (e.g. 'sgope', 'UHG')")
     deploy_parser.add_argument("flow", help="Flow name without .json (e.g. 'Snowflake-to-Postgres')")
-    deploy_parser.add_argument("--runtime", default=None, help="Runtime name (overrides OPENFLOW_RUNTIME in .env)")
+    deploy_parser.add_argument("--runtime", default=None, help="Runtime name (overrides .env default)")
     deploy_parser.add_argument("--name", default=None, help="Override the process group name")
     deploy_parser.add_argument("--start", action="store_true", help="Start the flow after deploying")
     deploy_parser.add_argument("--skip-config", action="store_true", help="Skip loading config.yaml")
+
+    # start
+    start_parser = subparsers.add_parser("start", help="Start a deployed flow on a runtime")
+    start_parser.add_argument("flow_name", help="Process group name of the deployed flow")
+    start_parser.add_argument("--runtime", default=None, help="Runtime name (overrides .env default)")
+
+    # stop
+    stop_parser = subparsers.add_parser("stop", help="Stop a deployed flow on a runtime")
+    stop_parser.add_argument("flow_name", help="Process group name of the deployed flow")
+    stop_parser.add_argument("--runtime", default=None, help="Runtime name (overrides .env default)")
 
     args = parser.parse_args()
 
@@ -542,8 +627,14 @@ if __name__ == "__main__":
     try:
         if args.command == "list-runtimes":
             cmd_list_runtimes(args)
+        elif args.command == "list-flows":
+            cmd_list_flows(args)
         elif args.command == "deploy":
             cmd_deploy(args)
+        elif args.command == "start":
+            cmd_start(args)
+        elif args.command == "stop":
+            cmd_stop(args)
     except requests.HTTPError as e:
         print("API error: %s" % e, file=sys.stderr)
         sys.exit(1)
