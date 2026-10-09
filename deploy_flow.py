@@ -5,12 +5,14 @@ deploy_flow.py — Download a NiFi flow JSON from GitHub and upload it to an Ope
 Optionally reads a companion .config.yaml to set parameters and upload assets (e.g. JDBC drivers).
 
 Usage:
-    1. Fill in your .env file with your GitHub PAT, Snowflake account, and runtime details.
-    2. Run:  python deploy_flow.py <bucket> <flow-name>
+    python deploy_flow.py deploy <bucket> <flow-name>
+    python deploy_flow.py deploy <bucket> <flow-name> --runtime SQL_API_TEST
+    python deploy_flow.py list-runtimes
 
 Example:
-    python deploy_flow.py sgope Snowflake-to-Postgres
-    python deploy_flow.py sgope SQLServer-Tuncate-Insert --start
+    python deploy_flow.py deploy sgope Snowflake-to-Postgres
+    python deploy_flow.py deploy sgope SQLServer-Tuncate-Insert --runtime POSTGRES_DEMO --start
+    python deploy_flow.py list-runtimes
 """
 
 import argparse
@@ -20,6 +22,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import uuid
 
 import nipyapi
@@ -43,56 +46,73 @@ SNOWFLAKE_ACCOUNT = os.environ["SNOWFLAKE_ACCOUNT"].strip()
 SNOWFLAKE_USER = os.environ["SNOWFLAKE_USER"].strip()
 SNOWFLAKE_PAT = os.environ["SNOWFLAKE_PAT"].strip()
 SNOWFLAKE_ROLE = os.environ.get("SNOWFLAKE_ROLE", "OPENFLOW_ADMIN").strip()
-OPENFLOW_DATABASE = os.environ["OPENFLOW_DATABASE"].strip()
-OPENFLOW_SCHEMA = os.environ["OPENFLOW_SCHEMA"].strip()
-OPENFLOW_RUNTIME = os.environ["OPENFLOW_RUNTIME"].strip()
+OPENFLOW_RUNTIME = os.environ.get("OPENFLOW_RUNTIME", "").strip()
 USE_PRIVATELINK = os.environ.get("USE_PRIVATELINK", "false").strip().lower() == "true"
 
 GITHUB_HEADERS = {"Authorization": "Bearer " + GITHUB_PAT, "Accept": "application/vnd.github.v3+json"}
 
 
 # ──────────────────────────────────────────────
-# 2. Resolve the OpenFlow runtime URL via SQL
+# 2. Snowflake connection + runtime discovery
 # ──────────────────────────────────────────────
 
-def resolve_runtime_url():
-    """Connect to Snowflake, look up the runtime key, and build the NiFi API URL."""
-    print("Connecting to Snowflake account: %s" % SNOWFLAKE_ACCOUNT)
-    conn = snowflake.connector.connect(
+def _get_snowflake_connection():
+    return snowflake.connector.connect(
         account=SNOWFLAKE_ACCOUNT,
         user=SNOWFLAKE_USER,
         token=SNOWFLAKE_PAT,
         authenticator="programmatic_access_token",
         role=SNOWFLAKE_ROLE,
     )
+
+
+def _get_account_locator(cur):
+    cur.execute("SELECT LOWER(CURRENT_ORGANIZATION_NAME() || '-' || CURRENT_ACCOUNT_NAME())")
+    return cur.fetchone()[0].replace("_", "-")
+
+
+def _build_runtime_url(account_locator, runtime_key):
+    domain = "privatelink.snowflakecomputing.app" if USE_PRIVATELINK else "snowflakecomputing.app"
+    return "https://of1--%s.%s/%s" % (account_locator, domain, runtime_key)
+
+
+def get_all_runtimes():
+    """Fetch all runtimes in the account with their database, schema, key, and status."""
+    print("Connecting to Snowflake account: %s" % SNOWFLAKE_ACCOUNT)
+    conn = _get_snowflake_connection()
     try:
         cur = conn.cursor()
-        cur.execute("SHOW OPENFLOW RUNTIMES IN SCHEMA %s.%s" % (OPENFLOW_DATABASE, OPENFLOW_SCHEMA))
+        cur.execute("SHOW OPENFLOW RUNTIMES IN ACCOUNT")
         rows = cur.fetchall()
         columns = [desc[0].lower() for desc in cur.description]
+        account_locator = _get_account_locator(cur)
 
+        runtimes = []
         for row in rows:
-            row_dict = dict(zip(columns, row))
-            if row_dict["name"] == OPENFLOW_RUNTIME:
-                runtime_key = row_dict["key"]
-                status = row_dict["status"]
-                print("Found runtime: %s (key: %s, status: %s)" % (OPENFLOW_RUNTIME, runtime_key, status))
-                if status != "ACTIVE":
-                    print("WARNING: Runtime is %s, not ACTIVE. Deploy may fail." % status, file=sys.stderr)
-
-                cur.execute("SELECT LOWER(CURRENT_ORGANIZATION_NAME() || '-' || CURRENT_ACCOUNT_NAME())")
-                account_locator = cur.fetchone()[0].replace("_", "-")
-                domain = "privatelink.snowflakecomputing.app" if USE_PRIVATELINK else "snowflakecomputing.app"
-                url = "https://of1--%s.%s/%s" % (account_locator, domain, runtime_key)
-                print("Runtime URL: %s" % url)
-                return url
-
-        raise ValueError("Runtime '%s' not found in %s.%s. Available: %s" % (
-            OPENFLOW_RUNTIME, OPENFLOW_DATABASE, OPENFLOW_SCHEMA,
-            ", ".join(dict(zip(columns, r))["name"] for r in rows)
-        ))
+            r = dict(zip(columns, row))
+            r["url"] = _build_runtime_url(account_locator, r["key"])
+            runtimes.append(r)
+        return runtimes
     finally:
         conn.close()
+
+
+def resolve_runtime_url(runtime_name):
+    """Look up a runtime by name across the entire account and return its URL."""
+    runtimes = get_all_runtimes()
+
+    for r in runtimes:
+        if r["name"] == runtime_name:
+            print("Found runtime: %s (%s.%s, key: %s, status: %s)" % (
+                r["name"], r["database_name"], r["schema_name"], r["key"], r["status"]
+            ))
+            if r["status"] != "ACTIVE":
+                print("WARNING: Runtime is %s, not ACTIVE. Deploy may fail." % r["status"], file=sys.stderr)
+            print("Runtime URL: %s" % r["url"])
+            return r["url"]
+
+    available = ", ".join("%s (%s)" % (r["name"], r["status"]) for r in runtimes)
+    raise ValueError("Runtime '%s' not found. Available: %s" % (runtime_name, available))
 
 
 # ──────────────────────────────────────────────
@@ -146,19 +166,11 @@ def download_config_from_github(bucket, flow_name):
 # 4. Resolve secrets in config parameters
 # ──────────────────────────────────────────────
 
-# Pattern: $SECRET{VAR_NAME} — resolved from .env / environment variables
 _SECRET_PATTERN = re.compile(r"^\$SECRET\{([^}]+)\}$")
 
 
 def resolve_secrets(params_dict):
-    """Replace $SECRET{VAR_NAME} values with the actual value from .env / environment.
-
-    In config.yaml:
-        SQLServer Password: "$SECRET{SQLSERVER_PWD}"
-
-    In .env:
-        SQLSERVER_PWD=Openflowdemo2025
-    """
+    """Replace $SECRET{VAR_NAME} values with the actual value from .env / environment."""
     if not params_dict:
         return params_dict
 
@@ -232,17 +244,14 @@ def _find_parameter_contexts(pg_id):
     ctx_ref = pg_entity.component.parameter_context
     if ctx_ref and ctx_ref.id:
         context_ids.add(ctx_ref.id)
-        # Also include inherited contexts
         ctx_full = pc_api.get_parameter_context(ctx_ref.id, include_inherited_parameters=False)
         for inherited in (ctx_full.component.inherited_parameter_contexts or []):
             context_ids.add(inherited.id)
 
-    # Check child process groups recursively
     flow_dto = nipyapi.nifi.FlowApi().get_flow(pg_id)
     for child_pg in (flow_dto.process_group_flow.flow.process_groups or []):
         context_ids.update(_find_parameter_contexts(child_pg.id))
 
-    # If we still have few contexts, scan all contexts on the runtime for ones matching the flow name
     if len(context_ids) <= 1:
         flow_name = pg_entity.component.name
         headers = {"Authorization": "Bearer " + SNOWFLAKE_PAT}
@@ -253,8 +262,6 @@ def _find_parameter_contexts(pg_id):
         if resp.ok:
             for ctx in resp.json().get("parameterContexts", []):
                 ctx_name = ctx["component"]["name"]
-                # Match contexts that share a naming prefix with the flow
-                # e.g. flow "SQLServer DELINS" matches "SQLServer DELINS Source Para"
                 flow_prefix = flow_name.split(" - ")[0].split(" (")[0]
                 if ctx_name.startswith(flow_prefix) or flow_prefix.startswith(ctx_name.split(" ")[0]):
                     context_ids.add(ctx["id"])
@@ -297,10 +304,6 @@ def apply_parameters(pg_id, params_dict):
             continue
 
         print("  Setting %d parameters on context '%s'" % (len(updates), ctx_name))
-
-        # Use raw HTTP POST — nipyapi's model serialization has issues with this endpoint
-        api_client = nipyapi.nifi.ApiClient()
-        api_client.configuration = nipyapi.config.nifi_config
         api_url = "%s/parameter-contexts/%s/update-requests" % (
             nipyapi.config.nifi_config.host, ctx_id
         )
@@ -320,7 +323,6 @@ def apply_parameters(pg_id, params_dict):
         resp.raise_for_status()
         request_id = resp.json()["request"]["requestId"]
 
-        # Wait for the update to complete
         while True:
             status_resp = requests.get(
                 "%s/parameter-contexts/%s/update-requests/%s" % (nipyapi.config.nifi_config.host, ctx_id, request_id),
@@ -332,7 +334,6 @@ def apply_parameters(pg_id, params_dict):
                     print("  ERROR: %s" % status_data["request"]["failureReason"], file=sys.stderr)
                 else:
                     print("  Done.")
-                # Clean up the update request
                 requests.delete(
                     "%s/parameter-contexts/%s/update-requests/%s" % (nipyapi.config.nifi_config.host, ctx_id, request_id),
                     headers=headers, timeout=30, verify=True,
@@ -357,7 +358,6 @@ def upload_assets(pg_id, assets_list):
     print("\nUploading %d asset(s)..." % len(assets_list))
     pc_api = nipyapi.nifi.ParameterContextsApi()
 
-    # Build a map of parameter_name -> (context_id, param_dto) across all contexts
     pg_entity = nipyapi.nifi.ProcessGroupsApi().get_process_group(pg_id)
     pc_ref = pg_entity.component.parameter_context
     if not pc_ref:
@@ -392,7 +392,6 @@ def upload_assets(pg_id, assets_list):
 
         ctx_id, param_dto = param_map[asset_param]
 
-        # Check if asset already exists
         existing_assets = {}
         result = pc_api.get_assets(context_id=ctx_id)
         for ae in (result.assets or []):
@@ -402,19 +401,16 @@ def upload_assets(pg_id, assets_list):
             asset_id = existing_assets[asset_name].id
             print("  Asset '%s' already exists (id=%s) — skipping upload" % (asset_name, asset_id))
         else:
-            # Download the asset file
             print("  Downloading: %s" % asset_name)
             resp = requests.get(asset_url, timeout=120, headers={"User-Agent": "nifihub-deploy/1.0"})
             resp.raise_for_status()
             print("  Downloaded %d bytes" % len(resp.content))
 
-            # Upload using nipyapi: create_asset(body=bytes, context_id=id, filename=name)
             print("  Uploading to parameter context...")
             upload_result = pc_api.create_asset(body=resp.content, context_id=ctx_id, filename=asset_name)
             asset_id = upload_result.asset.id
             print("  Uploaded asset '%s' (id=%s)" % (asset_name, asset_id))
 
-        # Bind the asset to the parameter
         print("  Binding parameter '%s' -> asset '%s'" % (asset_param, asset_name))
         pc = pc_api.get_parameter_context(id=ctx_id)
         current_params = {p.parameter.name: p.parameter for p in (pc.component.parameters or [])}
@@ -448,7 +444,6 @@ def upload_assets(pg_id, assets_list):
         req = pc_api.submit_parameter_context_update(context_id=ctx_id, body=body)
         request_id = req.request.request_id
 
-        import time
         while True:
             time.sleep(1)
             status = pc_api.get_parameter_context_update(context_id=ctx_id, request_id=request_id)
@@ -465,53 +460,92 @@ def upload_assets(pg_id, assets_list):
 # 8. Main
 # ──────────────────────────────────────────────
 
+def cmd_list_runtimes(args):
+    """List all available runtimes in the account."""
+    runtimes = get_all_runtimes()
+    if not runtimes:
+        print("No runtimes found.")
+        return
+    print("%-25s %-15s %-15s %-12s %s" % ("NAME", "DATABASE", "SCHEMA", "STATUS", "URL"))
+    print("-" * 120)
+    for r in runtimes:
+        print("%-25s %-15s %-15s %-12s %s" % (
+            r["name"], r["database_name"], r["schema_name"], r["status"], r["url"]
+        ))
+
+
+def cmd_deploy(args):
+    """Deploy a flow from GitHub to an OpenFlow runtime."""
+    runtime_name = args.runtime or OPENFLOW_RUNTIME
+    if not runtime_name:
+        print("ERROR: No runtime specified. Use --runtime NAME or set OPENFLOW_RUNTIME in .env", file=sys.stderr)
+        sys.exit(1)
+
+    # Step 1: Resolve runtime URL
+    runtime_url = resolve_runtime_url(runtime_name)
+
+    # Step 2: Download flow JSON from GitHub
+    flow_json = download_flow_from_github(args.bucket, args.flow)
+
+    # Step 3: Download config YAML from GitHub (optional)
+    flow_config = None
+    if not args.skip_config:
+        flow_config = download_config_from_github(args.bucket, args.flow)
+
+    # Step 4: Resolve secrets in config parameters
+    if flow_config and flow_config.get("parameters"):
+        flow_config["parameters"] = resolve_secrets(flow_config["parameters"])
+
+    # Step 5: Connect and deploy flow
+    root_pg_id = connect_to_runtime(runtime_url)
+    pg_id = deploy_flow_to_runtime(root_pg_id, flow_json, flow_name=args.name)
+
+    # Step 6: Apply parameters
+    if flow_config and flow_config.get("parameters"):
+        apply_parameters(pg_id, flow_config["parameters"])
+
+    # Step 7: Upload assets
+    if flow_config and flow_config.get("assets"):
+        upload_assets(pg_id, flow_config["assets"])
+
+    # Step 8: Start the flow
+    if args.start:
+        print("\nStarting flow...")
+        nipyapi.canvas.schedule_process_group(pg_id, True)
+        print("Flow started.")
+
+    print("\nDone! Process group ID: %s" % pg_id)
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Download a flow from GitHub and deploy to OpenFlow")
-    parser.add_argument("bucket", help="Flow bucket directory (e.g. 'sgope', 'examples')")
-    parser.add_argument("flow", help="Flow name without .json (e.g. 'Snowflake-to-Postgres')")
-    parser.add_argument("--name", default=None, help="Override the process group name")
-    parser.add_argument("--start", action="store_true", help="Start the flow after deploying")
-    parser.add_argument("--skip-config", action="store_true", help="Skip loading config.yaml (no params/assets)")
+    parser = argparse.ArgumentParser(description="Deploy NiFi flows from GitHub to OpenFlow runtimes")
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # list-runtimes
+    subparsers.add_parser("list-runtimes", help="List all available OpenFlow runtimes")
+
+    # deploy
+    deploy_parser = subparsers.add_parser("deploy", help="Deploy a flow to an OpenFlow runtime")
+    deploy_parser.add_argument("bucket", help="Flow bucket directory (e.g. 'sgope', 'UHG')")
+    deploy_parser.add_argument("flow", help="Flow name without .json (e.g. 'Snowflake-to-Postgres')")
+    deploy_parser.add_argument("--runtime", default=None, help="Runtime name (overrides OPENFLOW_RUNTIME in .env)")
+    deploy_parser.add_argument("--name", default=None, help="Override the process group name")
+    deploy_parser.add_argument("--start", action="store_true", help="Start the flow after deploying")
+    deploy_parser.add_argument("--skip-config", action="store_true", help="Skip loading config.yaml")
+
     args = parser.parse_args()
 
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
     try:
-        # Step 1: Resolve runtime URL
-        runtime_url = resolve_runtime_url()
-
-        # Step 2: Download flow JSON from GitHub
-        flow_json = download_flow_from_github(args.bucket, args.flow)
-
-        # Step 3: Download config YAML from GitHub (optional)
-        flow_config = None
-        if not args.skip_config:
-            flow_config = download_config_from_github(args.bucket, args.flow)
-
-        # Step 4: Resolve secrets in config parameters
-        if flow_config and flow_config.get("parameters"):
-            flow_config["parameters"] = resolve_secrets(flow_config["parameters"])
-
-        # Step 5: Connect and deploy flow
-        root_pg_id = connect_to_runtime(runtime_url)
-        pg_id = deploy_flow_to_runtime(root_pg_id, flow_json, flow_name=args.name)
-
-        # Step 6: Apply parameters
-        if flow_config and flow_config.get("parameters"):
-            apply_parameters(pg_id, flow_config["parameters"])
-
-        # Step 7: Upload assets
-        if flow_config and flow_config.get("assets"):
-            upload_assets(pg_id, flow_config["assets"])
-
-        # Step 8: Start the flow
-        if args.start:
-            print("\nStarting flow...")
-            nipyapi.canvas.schedule_process_group(pg_id, True)
-            print("Flow started.")
-
-        print("\nDone! Process group ID: %s" % pg_id)
-
+        if args.command == "list-runtimes":
+            cmd_list_runtimes(args)
+        elif args.command == "deploy":
+            cmd_deploy(args)
     except requests.HTTPError as e:
-        print("GitHub API error: %s" % e, file=sys.stderr)
+        print("API error: %s" % e, file=sys.stderr)
         sys.exit(1)
     except Exception as e:
         print("Error: %s" % e, file=sys.stderr)
