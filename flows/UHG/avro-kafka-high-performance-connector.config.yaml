@@ -1,0 +1,48 @@
+# avro-kafka-high-performance-connector.config.yaml
+# Parameters applied after deploying the flow to the runtime.
+# Only include parameters you want to set or override from the flow defaults.
+
+parameters:
+  # --- Kafka Source ---
+  Kafka Bootstrap Servers: "dlp-dev-gcp-kafka-kafka-0-client.dlp-common-c331a38.svc.prod1-us-east1.gke.kaas-prod-us.gcp.extscloud.com:16743,dlp-dev-gcp-kafka-kafka-1-client.dlp-common-c331a38.svc.prod1-us-east1.gke.kaas-prod-us.gcp.extscloud.com:16743,dlp-dev-gcp-kafka-kafka-2-client.dlp-common-c331a38.svc.prod1-us-east1.gke.kaas-prod-us.gcp.extscloud.com:16743,dlp-dev-gcp-kafka-kafka-3-client.dlp-common-c331a38.svc.prod1-us-east1.gke.kaas-prod-us.gcp.extscloud.com:16743,dlp-dev-gcp-kafka-kafka-4-client.dlp-common-c331a38.svc.prod1-us-east1.gke.kaas-prod-us.gcp.extscloud.com:16743"
+  Kafka Topics: "dlp-common-c331a38_dlp-dev-gcp-kafka.part"
+  Kafka Topic Format: "names"
+  Kafka Consumer Group ID: "hcpdlp-gcp-kafka-consumer-openflow-medium-100m-evol"
+  Kafka Auto Offset Reset: "earliest"
+  Schema Registry URL: "https://cfk.nonprod.schema-registry-prod-us.gcp.extscloud.com/"
+
+  # --- Avro Transform ---
+  AvroRecord Transform Spec: |
+    [
+      {
+        "operation": "shift",
+        "spec": {
+          "kafkaMetadata": "kafkaMetadata",
+          "headers": {
+            "operation": "CDC_FLAG",
+            "changeSequence": "header__change__seq"
+          },
+          "data": {
+            "*": "&"
+          }
+        }
+      }
+    ]
+
+  # --- Snowflake Destination ---
+  Snowflake Destination Database: "XYT_DEV_OPENFLOW_DB"
+  Snowflake Destination Schema: "POC_SCHEMA"
+  Snowflake Destination Table: "PART_ICEBERG_AVRO_EVOL"
+
+  # --- TLS (uncomment and set if needed) ---
+  # Keystore File: "$SECRET{KAFKA_KEYSTORE_FILE}"
+  # Truststore File: "$SECRET{KAFKA_TRUSTSTORE_FILE}"
+
+# Assets (uncomment if you need to upload keystore/truststore files)
+# assets:
+#   - name: "kafka-keystore.jks"
+#     url: "https://your-artifact-server/kafka-keystore.jks"
+#     parameter: "Keystore File"
+#   - name: "kafka-truststore.jks"
+#     url: "https://your-artifact-server/kafka-truststore.jks"
+#     parameter: "Truststore File"
