@@ -27,8 +27,22 @@ nipyapi_test/
 - **Auto-configure parameters** — optional `.config.yaml` sets parameter values after deploy
 - **Secret injection** — sensitive values (passwords) stored in `.env`, referenced as `$SECRET{VAR_NAME}` in config
 - **Asset uploads** — downloads JDBC drivers (or other JARs) and binds them to parameters
+- **Start/stop deployed flows** — manage running flows by name with `start` and `stop` commands
+- **List deployed flows** — see all flows on a runtime with their status
 - **Multi-runtime support** — list all runtimes, deploy to any by name with `--runtime`
 - **PrivateLink support** — toggle `USE_PRIVATELINK=true` for private connectivity
+
+---
+
+## Quick Reference
+
+```bash
+python deploy_flow.py list-runtimes                                          # List all runtimes
+python deploy_flow.py list-flows                                             # List deployed flows
+python deploy_flow.py deploy <bucket> <flow> [--runtime NAME] [--start]      # Deploy a flow
+python deploy_flow.py start "<flow-name>" [--runtime NAME]                   # Start a deployed flow
+python deploy_flow.py stop "<flow-name>" [--runtime NAME]                    # Stop a deployed flow
+```
 
 ---
 
@@ -168,6 +182,44 @@ The `<bucket>` and `<flow-name>` map to the file path in GitHub:
 ```
 flows / <bucket> / <flow-name>.json
 flows / sgope   / SQLServer-Tuncate-Insert.json
+```
+
+### List Deployed Flows on a Runtime
+
+```bash
+# List flows on default runtime
+python deploy_flow.py list-flows
+
+# List flows on a specific runtime
+python deploy_flow.py list-flows --runtime SQL_API_TEST
+```
+
+Output:
+```
+NAME                                     ID                                       STATUS
+----------------------------------------------------------------------------------------------------
+SQLServer-Tuncate-Insert                 1d191abf-01a1-1000-0000-00004359cf5a     STOPPED
+Snowflake-to-Postgres                    20dcda39-01a1-1000-0000-00004f1d666a     RUNNING
+```
+
+### Start a Deployed Flow
+
+```bash
+# Start on default runtime
+python deploy_flow.py start "SQLServer-Tuncate-Insert"
+
+# Start on a specific runtime
+python deploy_flow.py start "SQLServer-Tuncate-Insert" --runtime SQL_API_TEST
+```
+
+### Stop a Deployed Flow
+
+```bash
+# Stop on default runtime
+python deploy_flow.py stop "SQLServer-Tuncate-Insert"
+
+# Stop on a specific runtime
+python deploy_flow.py stop "SQLServer-Tuncate-Insert" --runtime SQL_API_TEST
 ```
 
 ---
