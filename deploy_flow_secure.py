@@ -39,10 +39,10 @@ _PGConfigEntity.parameter_sensitivities = _PGConfigEntity.parameter_sensitivitie
 
 
 # ──────────────────────────────────────────────
-# 1. Load config from .env_secure
+# 1. Load config from .env
 # ──────────────────────────────────────────────
 
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env_secure"))
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 GITHUB_PAT = os.environ["GITHUB_PAT"].strip()
 GITHUB_REPO = os.environ["GITHUB_REPO"].strip()
@@ -141,12 +141,27 @@ def download_flow_from_github(bucket, flow_name):
     return flow_json
 
 
-def download_config_from_github(bucket, flow_name):
+def download_config(bucket, flow_name):
+    """Load config YAML — local file first, then GitHub as fallback."""
     base_name = flow_name.removesuffix(".json")
-    config_filename = base_name + ".config.secure.yaml"
+    config_filename = base_name + ".config.yaml"
+
+    # Try local file first
+    local_path = os.path.join(os.path.dirname(__file__), GITHUB_FLOWS_PATH.strip("/"), bucket, config_filename)
+    if os.path.isfile(local_path):
+        print("Loading config (local): %s" % local_path)
+        with open(local_path) as f:
+            config = yaml.safe_load(f)
+        print("Found config with %d parameters, %d assets" % (
+            len(config.get("parameters", {})),
+            len(config.get("assets", [])),
+        ))
+        return config
+
+    # Fall back to GitHub
     path = "%s/%s/%s" % (GITHUB_FLOWS_PATH.strip("/"), bucket, config_filename)
     try:
-        print("Looking for config: %s" % path)
+        print("Looking for config (GitHub): %s" % path)
         raw = _download_github_file(path)
         config = yaml.safe_load(raw)
         print("Found config with %d parameters, %d assets" % (
@@ -156,7 +171,7 @@ def download_config_from_github(bucket, flow_name):
         return config
     except requests.HTTPError as e:
         if e.response.status_code == 404:
-            print("No config.secure.yaml found — skipping parameters/assets")
+            print("No config.yaml found — skipping parameters/assets")
             return None
         raise
 
@@ -243,11 +258,12 @@ def resolve_sf_secrets(params_dict):
     """Detect $SF_SECRET{DB.SCHEMA.SECRET} values, trigger the Parameter Provider,
     and return (resolved_params, context_names_to_inherit).
 
-    resolved_params: params with $SF_SECRET replaced by #{SECRET_NAME}
+    resolved_params: params with $SF_SECRET entries REMOVED (not set as param values)
     context_names_to_inherit: NiFi parameter context names to add as inherited
+    rewire_map: dict of {param_name: secret_name} for controller service property rewiring
     """
     if not params_dict:
-        return params_dict, []
+        return params_dict, [], {}
 
     sf_secrets = {}
     for param_name, param_value in params_dict.items():
@@ -264,7 +280,7 @@ def resolve_sf_secrets(params_dict):
                 sf_secrets[param_name] = (fqn, group_key, secret_name)
 
     if not sf_secrets:
-        return params_dict, []
+        return params_dict, [], {}
 
     print("\nResolving %d Snowflake secret(s) via Parameter Provider..." % len(sf_secrets))
 
@@ -279,12 +295,14 @@ def resolve_sf_secrets(params_dict):
 
     resolved = dict(params_dict)
     contexts_to_inherit = set()
+    rewire_map = {}
     for param_name, (fqn, group_key, secret_name) in sf_secrets.items():
-        resolved[param_name] = "#{%s}" % secret_name
+        del resolved[param_name]  # Don't set as parameter value — nested #{} doesn't resolve
+        rewire_map[param_name] = secret_name.strip()
         contexts_to_inherit.add(group_key)
-        print("  %s -> #{%s} (from Snowflake secret %s)" % (param_name, secret_name, fqn))
+        print("  %s -> will rewire to #{%s} (from Snowflake secret %s)" % (param_name, secret_name.strip(), fqn))
 
-    return resolved, list(contexts_to_inherit)
+    return resolved, list(contexts_to_inherit), rewire_map
 
 
 # ──────────────────────────────────────────────
@@ -420,6 +438,93 @@ def _find_parameter_contexts(pg_id):
     return context_ids
 
 
+def rewire_controller_services(pg_id, rewire_map):
+    """Update controller service properties to reference Snowflake secrets directly.
+
+    NiFi parameter references don't nest: setting a parameter value to #{X} stores
+    the literal string, it doesn't resolve X. So for $SF_SECRET params we skip
+    setting the parameter value and instead update the controller service property
+    to reference #{secret_name} directly.
+
+    Since sensitive properties are masked ('********') by the NiFi API, we can't
+    match by value. Instead we identify the right property by checking if the CS
+    has any property whose existing value references a parameter name in our rewire map.
+    For sensitive (masked) properties, we detect them by finding CS properties whose
+    descriptor name matches common password patterns AND whose parameter context has
+    a matching parameter from the rewire map.
+    """
+    if not rewire_map:
+        return
+    print("\nRewiring %d controller-service propert(ies) to Snowflake secrets..." % len(rewire_map))
+    headers = {"Content-Type": "application/json", "Authorization": "Bearer " + SNOWFLAKE_PAT}
+    base = nipyapi.config.nifi_config.host
+
+    # Build lookup: "#{param_name}" -> "#{secret_name}" for non-sensitive properties
+    ref_old_to_new = {}
+    for param_name, secret_name in rewire_map.items():
+        ref_old_to_new["#{%s}" % param_name] = "#{%s}" % secret_name
+
+    # Scan controller services in this process group
+    resp = requests.get("%s/flow/process-groups/%s/controller-services" % (base, pg_id),
+                        headers=headers, timeout=30)
+    resp.raise_for_status()
+    for cs in resp.json().get("controllerServices", []):
+        cs_id = cs["id"]
+        cs_name = cs["component"]["name"]
+        props = cs["component"].get("properties") or {}
+        descs = cs["component"].get("descriptors") or {}
+        updates = {}
+
+        for prop_key, prop_val in props.items():
+            # Case 1: non-sensitive property with visible #{param_name} reference
+            if isinstance(prop_val, str) and prop_val in ref_old_to_new:
+                updates[prop_key] = ref_old_to_new[prop_val]
+                continue
+            # Case 2: sensitive property (masked as '********')
+            desc = descs.get(prop_key, {})
+            if desc.get("sensitive") and prop_val == "********":
+                # Check if this property likely references one of our rewire params
+                # by matching the descriptor name against parameter names
+                for param_name, secret_name in rewire_map.items():
+                    # Match: "SQLServer Password" param -> "Password" CS property
+                    # or any property whose name appears as a suffix of the param name
+                    prop_lower = prop_key.lower().strip()
+                    param_lower = param_name.lower().strip()
+                    if prop_lower in param_lower or param_lower.endswith(prop_lower):
+                        updates[prop_key] = "#{%s}" % secret_name
+                        break
+
+        if not updates:
+            continue
+
+        # Disable the service before updating if it's enabled
+        cs_state = cs["component"].get("state", "DISABLED")
+        if cs_state == "ENABLED":
+            disable_body = json.dumps({"revision": cs["revision"], "state": "DISABLED",
+                                       "disconnectedNodeAcknowledged": False})
+            dr = requests.put("%s/controller-services/%s/run-status" % (base, cs_id),
+                              data=disable_body, headers=headers, timeout=30)
+            dr.raise_for_status()
+            time.sleep(2)
+            cs_resp = requests.get("%s/controller-services/%s" % (base, cs_id),
+                                   headers=headers, timeout=30)
+            cs_resp.raise_for_status()
+            cs = cs_resp.json()
+
+        new_props = dict(props)
+        for prop_key, new_val in updates.items():
+            new_props[prop_key] = new_val
+            print("  %s [%s] -> %s" % (cs_name, prop_key, new_val))
+        update_body = json.dumps({
+            "revision": cs["revision"],
+            "component": {"id": cs_id, "properties": new_props}
+        })
+        ur = requests.put("%s/controller-services/%s" % (base, cs_id),
+                          data=update_body, headers=headers, timeout=30)
+        ur.raise_for_status()
+        print("  Updated %s" % cs_name)
+
+
 def apply_parameters(pg_id, params_dict):
     if not params_dict:
         return
@@ -437,7 +542,7 @@ def apply_parameters(pg_id, params_dict):
         updates = []
         for param_name, param_value in params_dict.items():
             if param_name in existing_params:
-                updates.append({"parameter": {"name": param_name, "value": str(param_value), "sensitive": existing_params[param_name].parameter.sensitive}})
+                updates.append({"parameter": {"name": param_name, "value": str(param_value).strip(), "sensitive": existing_params[param_name].parameter.sensitive}})
                 params_applied.add(param_name)
         if not updates:
             continue
@@ -516,6 +621,10 @@ def upload_assets(pg_id, assets_list):
                 updated.append(nipyapi.nifi.ParameterEntity(parameter=nipyapi.nifi.ParameterDTO(
                     name=name, sensitive=param.sensitive, description=param.description,
                     referenced_assets=[nipyapi.nifi.AssetReferenceDTO(id=asset_id, name=asset_name)])))
+            elif param.sensitive:
+                # Skip sensitive params — re-submitting them sends the masked
+                # '********' value which overwrites the real secret
+                continue
             else:
                 updated.append(nipyapi.nifi.ParameterEntity(parameter=param))
         body = nipyapi.nifi.ParameterContextEntity(id=ctx_id, revision=pc.revision,
@@ -541,7 +650,7 @@ def upload_assets(pg_id, assets_list):
 def _get_runtime_name(args):
     runtime_name = args.runtime or OPENFLOW_RUNTIME
     if not runtime_name:
-        print("ERROR: No runtime specified. Use --runtime NAME or set OPENFLOW_RUNTIME in .env_secure", file=sys.stderr)
+        print("ERROR: No runtime specified. Use --runtime NAME or set OPENFLOW_RUNTIME in .env", file=sys.stderr)
         sys.exit(1)
     return runtime_name
 
@@ -589,18 +698,73 @@ def cmd_list_flows(args):
         state = "RUNNING" if snap.active_thread_count and snap.active_thread_count > 0 else "STOPPED"
         print("%-40s %-40s %s" % (pg.component.name, pg.id, state))
 
+def _enable_controller_services(pg_id):
+    """Enable all DISABLED controller services in a process group."""
+    headers = {"Content-Type": "application/json", "Authorization": "Bearer " + SNOWFLAKE_PAT}
+    base = nipyapi.config.nifi_config.host
+    resp = requests.get("%s/flow/process-groups/%s/controller-services" % (base, pg_id),
+                        headers=headers, timeout=30)
+    resp.raise_for_status()
+    services = resp.json().get("controllerServices", [])
+    disabled = [cs for cs in services if cs["component"]["state"] == "DISABLED"]
+    if not disabled:
+        print("  All controller services already enabled.")
+        return
+    for cs in disabled:
+        cs_id = cs["id"]
+        cs_name = cs["component"]["name"]
+        body = json.dumps({"revision": cs["revision"], "state": "ENABLED",
+                           "disconnectedNodeAcknowledged": False})
+        r = requests.put("%s/controller-services/%s/run-status" % (base, cs_id),
+                         data=body, headers=headers, timeout=30)
+        if r.ok:
+            print("  Enabled: %s" % cs_name)
+        else:
+            print("  WARNING: Failed to enable %s: %s" % (cs_name, r.text[:200]), file=sys.stderr)
+    time.sleep(3)
+
+
 def cmd_start(args):
     _connect_to_named_runtime(_get_runtime_name(args))
     pg = _find_pg_by_name(args.flow_name)
+    print("Enabling controller services...")
+    _enable_controller_services(pg.id)
     print("Starting: %s" % pg.component.name)
     nipyapi.canvas.schedule_process_group(pg.id, True)
     print("Flow started.")
+
+def _disable_controller_services(pg_id):
+    """Disable all ENABLED controller services in a process group."""
+    headers = {"Content-Type": "application/json", "Authorization": "Bearer " + SNOWFLAKE_PAT}
+    base = nipyapi.config.nifi_config.host
+    resp = requests.get("%s/flow/process-groups/%s/controller-services" % (base, pg_id),
+                        headers=headers, timeout=30)
+    resp.raise_for_status()
+    services = resp.json().get("controllerServices", [])
+    enabled = [cs for cs in services if cs["component"]["state"] == "ENABLED"]
+    if not enabled:
+        return
+    for cs in enabled:
+        cs_id = cs["id"]
+        cs_name = cs["component"]["name"]
+        body = json.dumps({"revision": cs["revision"], "state": "DISABLED",
+                           "disconnectedNodeAcknowledged": False})
+        r = requests.put("%s/controller-services/%s/run-status" % (base, cs_id),
+                         data=body, headers=headers, timeout=30)
+        if r.ok:
+            print("  Disabled: %s" % cs_name)
+        else:
+            print("  WARNING: Failed to disable %s: %s" % (cs_name, r.text[:200]), file=sys.stderr)
+
 
 def cmd_stop(args):
     _connect_to_named_runtime(_get_runtime_name(args))
     pg = _find_pg_by_name(args.flow_name)
     print("Stopping: %s" % pg.component.name)
     nipyapi.canvas.schedule_process_group(pg.id, False)
+    time.sleep(3)
+    print("Disabling controller services...")
+    _disable_controller_services(pg.id)
     print("Flow stopped.")
 
 def cmd_deploy(args):
@@ -615,15 +779,16 @@ def cmd_deploy(args):
     # Step 3: Download config YAML from GitHub (optional)
     flow_config = None
     if not args.skip_config:
-        flow_config = download_config_from_github(args.bucket, args.flow)
+        flow_config = download_config(args.bucket, args.flow)
 
     # Step 4: Connect to runtime
     root_pg_id = connect_to_runtime(runtime_url)
 
     # Step 5: Resolve Snowflake secrets via Parameter Provider
     contexts_to_inherit = []
+    rewire_map = {}
     if flow_config and flow_config.get("parameters"):
-        flow_config["parameters"], contexts_to_inherit = resolve_sf_secrets(flow_config["parameters"])
+        flow_config["parameters"], contexts_to_inherit, rewire_map = resolve_sf_secrets(flow_config["parameters"])
 
     # Step 6: Deploy flow
     pg_id = deploy_flow_to_runtime(root_pg_id, flow_json, flow_name=args.name)
@@ -633,9 +798,13 @@ def cmd_deploy(args):
         print("\nWiring inherited parameter contexts...")
         add_inherited_contexts(pg_id, contexts_to_inherit)
 
-    # Step 8: Apply parameters (secrets are now #{SECRET_NAME} references)
+    # Step 8: Apply parameters (SF_SECRET params excluded — handled via rewiring)
     if flow_config and flow_config.get("parameters"):
         apply_parameters(pg_id, flow_config["parameters"])
+
+    # Step 8b: Rewire controller service properties to reference Snowflake secrets directly
+    if rewire_map:
+        rewire_controller_services(pg_id, rewire_map)
 
     # Step 9: Upload assets
     if flow_config and flow_config.get("assets"):
@@ -662,10 +831,10 @@ if __name__ == "__main__":
     dp = subparsers.add_parser("deploy", help="Deploy a flow to an OpenFlow runtime")
     dp.add_argument("bucket", help="Flow bucket directory (e.g. 'sgope')")
     dp.add_argument("flow", help="Flow name without .json")
-    dp.add_argument("--runtime", default=None, help="Runtime name (overrides .env_secure)")
+    dp.add_argument("--runtime", default=None, help="Runtime name (overrides .env)")
     dp.add_argument("--name", default=None, help="Override process group name")
     dp.add_argument("--start", action="store_true", help="Start after deploying")
-    dp.add_argument("--skip-config", action="store_true", help="Skip config.secure.yaml")
+    dp.add_argument("--skip-config", action="store_true", help="Skip config.yaml")
 
     sp = subparsers.add_parser("start", help="Start a deployed flow")
     sp.add_argument("flow_name")
