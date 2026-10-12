@@ -27,7 +27,6 @@ nipyapi_test/
 - **Deploy flows from GitHub** — downloads flow JSON and uploads to any OpenFlow runtime
 - **Auto-configure parameters** — optional `.config.yaml` sets parameter values after deploy
 - **Snowflake secret resolution** — passwords resolved from Snowflake SECRET objects via the runtime's Parameter Provider (`$SF_SECRET{DB.SCHEMA.SECRET}`)
-- **Legacy secret injection** — also supports `$SECRET{VAR_NAME}` for values stored in `.env`
 - **Asset uploads** — downloads JDBC drivers (or other JARs) and binds them to parameters
 - **Start/stop deployed flows** — enables/disables controller services automatically
 - **List deployed flows** — see all flows on a runtime with their status
@@ -251,14 +250,18 @@ assets:
 
 ### Secret Handling
 
-Two patterns are supported for sensitive parameter values:
-
-#### `$SF_SECRET{DB.SCHEMA.SECRET_NAME}` (recommended)
-
-Resolves the password from a Snowflake SECRET object at runtime via the Parameter Provider. No passwords are stored in `.env` or config files.
+Sensitive parameter values are resolved from Snowflake SECRET objects at runtime via the **Snowflake Parameter Provider**. No passwords are stored in `.env` or config files.
 
 ```yaml
 SQLServer Password: "$SF_SECRET{OPENFLOW.OPENFLOW.API_POSTGRESQL}"
+```
+
+The format is `$SF_SECRET{DATABASE.SCHEMA.SECRET_NAME}`, referencing a Snowflake SECRET object:
+
+```sql
+CREATE SECRET IF NOT EXISTS OPENFLOW.OPENFLOW.API_POSTGRESQL
+  TYPE = GENERIC_STRING
+  SECRET_STRING = 'YourPasswordHere';
 ```
 
 How it works:
@@ -266,19 +269,6 @@ How it works:
 2. The Parameter Provider creates a NiFi parameter context (e.g. `OPENFLOW.OPENFLOW`) with the secret values
 3. The script rewires the controller service property to reference `#{SECRET_NAME}` directly
 4. The flow's parameter context inherits from the Parameter Provider context
-
-#### `$SECRET{VAR_NAME}` (legacy)
-
-Reads the value from `.env` and injects it directly into the NiFi parameter:
-
-```yaml
-SQLServer Password: "$SECRET{SQLSERVER_PWD}"
-```
-
-With corresponding `.env` entry:
-```env
-SQLSERVER_PWD=MySecretPassword123
-```
 
 ### Assets
 
