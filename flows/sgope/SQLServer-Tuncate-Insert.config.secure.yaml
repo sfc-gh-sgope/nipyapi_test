@@ -1,0 +1,27 @@
+# SQLServer-Tuncate-Insert.config.secure.yaml
+# Parameters applied after deploying the flow to the runtime.
+# Passwords are resolved from Snowflake SECRET objects via the Parameter Provider.
+# No plain text passwords in this file or .env_secure.
+
+parameters:
+  # --- Source (SQLServer) ---
+  SQLServer Connection URL: "jdbc:sqlserver://shantanu-mssql-1.cfgog6egqv3o.us-east-1.rds.amazonaws.com:1433;encrypt=false"
+  SQLServer Username: "admin"
+  SQLServer Password: "$SF_SECRET{OPENFLOW.OPENFLOW.API_POSTGRESQL}"     # Resolved from Snowflake secret at runtime
+  SQLServer Query Interval: "10 sec"
+  Included Table Names: "shantanu.msql_openflow.NRVA_Ascension_CIP,shantanu.msql_openflow.customers"
+  Ingestion Type: "full"
+
+  # --- Destination (Snowflake) ---
+  Destination Database: "OPENFLOW_LOAD"
+  Destination Schema Pattern: "SQL_SERVER_FULL"
+  Snowflake Warehouse: "openflow_wh"
+  Snowflake Role: "openflow_role_rw"
+  Snowflake Authentication Strategy: "SNOWFLAKE_MANAGED"
+  Snowflake Object Identifier Resolution: "CASE_INSENSITIVE"
+
+# Assets to download and upload (e.g. JDBC drivers)
+assets:
+  - name: "mssql-jdbc-12.8.1.jre11.jar"
+    url: "https://repo1.maven.org/maven2/com/microsoft/sqlserver/mssql-jdbc/12.8.1.jre11/mssql-jdbc-12.8.1.jre11.jar"
+    parameter: "SQLServer JDBC Driver"
