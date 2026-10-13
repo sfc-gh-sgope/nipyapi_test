@@ -34,15 +34,11 @@ parameters:
   Snowflake Destination Schema: "POC_SCHEMA"
   Snowflake Destination Table: "PART_ICEBERG_AVRO_EVOL"
 
-  # --- TLS (uncomment and set if needed) ---
-  # Keystore File: "$SECRET{KAFKA_KEYSTORE_FILE}"
-  # Truststore File: "$SECRET{KAFKA_TRUSTSTORE_FILE}"
-
-# Assets (uncomment if you need to upload keystore/truststore files)
-# assets:
-#   - name: "kafka-keystore.jks"
-#     url: "https://your-artifact-server/kafka-keystore.jks"
-#     parameter: "Keystore File"
-#   - name: "kafka-truststore.jks"
-#     url: "https://your-artifact-server/kafka-truststore.jks"
-#     parameter: "Truststore File"
+# Assets — downloaded from Snowflake internal stage
+assets:
+  - name: "kafka.client.keystore.jks"
+    stage: "OPENFLOW.OPENFLOW.NIFI_ASSETS"
+    parameter: "Keystore File"
+  - name: "kafka.client.truststore.jks"
+    stage: "OPENFLOW.OPENFLOW.NIFI_ASSETS"
+    parameter: "Truststore File"

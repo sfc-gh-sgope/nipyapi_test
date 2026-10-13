@@ -572,6 +572,30 @@ def apply_parameters(pg_id, params_dict):
 # 8. Upload assets from config.yaml
 # ──────────────────────────────────────────────
 
+def _download_from_stage(stage_path, filename):
+    """Download a file from a Snowflake internal stage and return its bytes."""
+    import tempfile
+    conn = _get_snowflake_connection()
+    cur = conn.cursor()
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cur.execute("GET @%s/%s 'file://%s'" % (stage_path, filename, tmpdir))
+            local_file = os.path.join(tmpdir, filename)
+            if not os.path.isfile(local_file):
+                # Stage GET may append .gz — check for that
+                local_gz = local_file + ".gz"
+                if os.path.isfile(local_gz):
+                    import gzip
+                    with gzip.open(local_gz, "rb") as f:
+                        return f.read()
+                raise FileNotFoundError("GET @%s/%s did not produce local file" % (stage_path, filename))
+            with open(local_file, "rb") as f:
+                return f.read()
+    finally:
+        cur.close()
+        conn.close()
+
+
 def upload_assets(pg_id, assets_list):
     if not assets_list:
         return
@@ -596,7 +620,9 @@ def upload_assets(pg_id, assets_list):
             walk(inh.id)
     walk(pc_ref.id)
     for asset_def in assets_list:
-        asset_name, asset_url, asset_param = asset_def["name"], asset_def["url"], asset_def["parameter"]
+        asset_name, asset_param = asset_def["name"], asset_def["parameter"]
+        asset_url = asset_def.get("url", "")
+        asset_stage = asset_def.get("stage", "")
         if asset_param not in param_map:
             print("  WARNING: Parameter '%s' not found — skipping '%s'" % (asset_param, asset_name), file=sys.stderr)
             continue
@@ -606,11 +632,21 @@ def upload_assets(pg_id, assets_list):
             asset_id = existing[asset_name].id
             print("  Asset '%s' exists (id=%s) — skipping upload" % (asset_name, asset_id))
         else:
-            print("  Downloading: %s" % asset_name)
-            resp = requests.get(asset_url, timeout=120, headers={"User-Agent": "nifihub-deploy/1.0"})
-            resp.raise_for_status()
-            print("  Uploading to parameter context...")
-            upload_result = pc_api.create_asset(body=resp.content, context_id=ctx_id, filename=asset_name)
+            if asset_stage:
+                # Download from Snowflake internal stage
+                print("  Downloading from stage: %s" % asset_stage)
+                asset_bytes = _download_from_stage(asset_stage, asset_name)
+            elif asset_url:
+                # Download from HTTP URL
+                print("  Downloading: %s" % asset_url)
+                resp = requests.get(asset_url, timeout=120, headers={"User-Agent": "nifihub-deploy/1.0"})
+                resp.raise_for_status()
+                asset_bytes = resp.content
+            else:
+                print("  WARNING: No 'url' or 'stage' for asset '%s' — skipping" % asset_name, file=sys.stderr)
+                continue
+            print("  Uploading to parameter context (%d bytes)..." % len(asset_bytes))
+            upload_result = pc_api.create_asset(body=asset_bytes, context_id=ctx_id, filename=asset_name)
             asset_id = upload_result.asset.id
             print("  Uploaded '%s' (id=%s)" % (asset_name, asset_id))
         print("  Binding '%s' -> '%s'" % (asset_param, asset_name))
@@ -622,8 +658,11 @@ def upload_assets(pg_id, assets_list):
                     name=name, sensitive=param.sensitive, description=param.description,
                     referenced_assets=[nipyapi.nifi.AssetReferenceDTO(id=asset_id, name=asset_name)])))
             elif param.sensitive:
-                # Skip sensitive params — re-submitting them sends the masked
-                # '********' value which overwrites the real secret
+                # Skip sensitive params — re-submitting sends masked '********'
+                continue
+            elif param.referenced_assets:
+                # Skip params that already have asset bindings — re-submitting
+                # them with both a value and asset reference causes a 400 error
                 continue
             else:
                 updated.append(nipyapi.nifi.ParameterEntity(parameter=param))

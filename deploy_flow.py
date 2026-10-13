@@ -429,8 +429,10 @@ def upload_assets(pg_id, assets_list):
                     )
                 ))
             elif param.sensitive:
-                # Skip sensitive params — re-submitting them sends the masked
-                # '********' value which overwrites the real secret
+                # Skip sensitive params — re-submitting sends masked '********'
+                continue
+            elif param.referenced_assets:
+                # Skip params with existing asset bindings — value + asset = 400 error
                 continue
             else:
                 updated_params.append(nipyapi.nifi.ParameterEntity(parameter=param))
