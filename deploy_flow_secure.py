@@ -203,8 +203,12 @@ def _fetch_parameter_provider(pp):
     return result
 
 
-def _apply_parameter_provider(provider_id, target_groups):
-    """Enable target parameter groups and apply to create NiFi parameter contexts."""
+def _apply_parameter_provider(provider_id, target_groups, requested_secrets=None):
+    """Enable target parameter groups and apply to create NiFi parameter contexts.
+
+    requested_secrets: optional dict of {group_key: set(secret_name, ...)}
+                       If provided, only these secrets are included in the context.
+    """
     api = nipyapi.nifi.ParameterProvidersApi()
     pp = api.get_parameter_provider(provider_id)
     groups = pp.component.parameter_group_configurations or []
@@ -216,14 +220,19 @@ def _apply_parameter_provider(provider_id, target_groups):
     for group in groups:
         group_key = group.group_name
         if group_key in target_groups:
-            sensitivities = dict(group.parameter_sensitivities or {})
-            for pname in sensitivities:
-                sensitivities[pname] = "SENSITIVE"
-            group.parameter_sensitivities = sensitivities
+            all_sensitivities = dict(group.parameter_sensitivities or {})
+            if requested_secrets and group_key in requested_secrets:
+                # Only include the secrets referenced in the YAML
+                needed = requested_secrets[group_key]
+                filtered = {pname: "SENSITIVE" for pname in all_sensitivities if pname in needed}
+                print("  Enabling %d of %d secret(s) in group %s: %s" % (
+                    len(filtered), len(all_sensitivities), group_key, ", ".join(sorted(filtered))))
+            else:
+                filtered = {pname: "SENSITIVE" for pname in all_sensitivities}
+            group.parameter_sensitivities = filtered
             group.synchronized = True
             if not group.parameter_context_name:
                 group.parameter_context_name = group.group_name
-            print("  Enabling parameter group: %s" % group_key)
 
     body = nipyapi.nifi.ParameterProviderParameterApplicationEntity(
         id=provider_id,
@@ -291,7 +300,11 @@ def resolve_sf_secrets(params_dict):
     _fetch_parameter_provider(pp)
 
     target_groups = set(info[1] for info in sf_secrets.values())
-    context_names = _apply_parameter_provider(pp.id, target_groups)
+    # Build map of {group_key: set(secret_name)} to limit which secrets get applied
+    requested_secrets = {}
+    for _, (fqn, group_key, secret_name) in sf_secrets.items():
+        requested_secrets.setdefault(group_key, set()).add(secret_name)
+    context_names = _apply_parameter_provider(pp.id, target_groups, requested_secrets)
 
     resolved = dict(params_dict)
     contexts_to_inherit = set()
