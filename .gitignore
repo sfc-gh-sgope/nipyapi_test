@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 *.jar
 .env_secure
+.DS_Store

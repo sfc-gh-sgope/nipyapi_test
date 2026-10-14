@@ -132,11 +132,23 @@ def _download_github_file(path):
     return base64.b64decode(content_b64).decode("utf-8")
 
 
-def download_flow_from_github(bucket, flow_name):
+def download_flow(bucket, flow_name):
+    """Load flow JSON — local file first, then GitHub as fallback."""
     filename = flow_name if flow_name.endswith(".json") else flow_name + ".json"
-    path = "%s/%s/%s" % (GITHUB_FLOWS_PATH.strip("/"), bucket, filename)
-    print("Downloading flow from GitHub: %s (branch: %s)" % (path, GITHUB_BRANCH))
-    flow_json = json.loads(_download_github_file(path))
+    rel_path = "%s/%s/%s" % (GITHUB_FLOWS_PATH.strip("/"), bucket, filename)
+
+    # Try local file first
+    local_path = os.path.join(os.path.dirname(__file__), rel_path)
+    if os.path.isfile(local_path):
+        print("Loading flow (local): %s" % local_path)
+        with open(local_path) as f:
+            flow_json = json.load(f)
+        print("Loaded flow: %s" % flow_json.get("flowContents", {}).get("name", flow_name))
+        return flow_json
+
+    # Fall back to GitHub
+    print("Downloading flow (GitHub): %s (branch: %s)" % (rel_path, GITHUB_BRANCH))
+    flow_json = json.loads(_download_github_file(rel_path))
     print("Downloaded flow: %s" % flow_json.get("flowContents", {}).get("name", flow_name))
     return flow_json
 
@@ -826,7 +838,7 @@ def cmd_deploy(args):
     runtime_url = resolve_runtime_url(runtime_name)
 
     # Step 2: Download flow JSON from GitHub
-    flow_json = download_flow_from_github(args.bucket, args.flow)
+    flow_json = download_flow(args.bucket, args.flow)
 
     # Step 3: Download config YAML from GitHub (optional)
     flow_config = None

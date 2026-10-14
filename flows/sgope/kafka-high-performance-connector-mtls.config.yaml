@@ -1,0 +1,32 @@
+# kafka-high-performance-connector-mtls.config.yaml
+# Parameters and assets applied after deploying the flow to the runtime.
+# Secrets are resolved from Snowflake SECRET objects via the Parameter Provider.
+
+parameters:
+  # --- Kafka Source ---
+  Kafka Bootstrap Servers: "b-1-public.sgopemskcluster.urjjv3.c20.kafka.us-east-1.amazonaws.com:9194,b-3-public.sgopemskcluster.urjjv3.c20.kafka.us-east-1.amazonaws.com:9194"
+  Kafka Topics: "json_topic"
+  Kafka Topic Format: "names"
+  Kafka Consumer Group ID: "11"
+  Kafka Auto Offset Reset: "earliest"
+  Kafka SASL Username: "kafkauser"
+  Kafka SASL Password: "$SF_SECRET{OPENFLOW.OPENFLOW.KAFKA_SSL}"
+
+  # --- TLS / mTLS ---
+  SSL Key Password: "$SF_SECRET{OPENFLOW.OPENFLOW.KAFKA_KEYSTORE}"
+  SSL Keystore Password: "$SF_SECRET{OPENFLOW.OPENFLOW.KAFKA_KEYSTORE}"
+  SSL Truststore Password: "$SF_SECRET{OPENFLOW.OPENFLOW.KAFKA_TRUSTSTORE}"
+
+  # --- Snowflake Destination ---
+  Snowflake Destination Database: "KAFKA_DB"
+  Snowflake Destination Schema: "KAFKA_SCHEMA"
+  Snowflake Destination Table: "KAFKA_TABLE"
+
+# Assets — downloaded from Snowflake internal stage
+assets:
+  - name: "kafka.client.keystore.jks"
+    stage: "OPENFLOW.OPENFLOW.NIFI_ASSETS"
+    parameter: "SSL Keystore"
+  - name: "kafka.client.truststore.jks"
+    stage: "OPENFLOW.OPENFLOW.NIFI_ASSETS"
+    parameter: "SSL Truststore"
