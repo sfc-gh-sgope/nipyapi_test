@@ -8,10 +8,11 @@ A Python tool that downloads NiFi flow definitions from a GitHub repo and deploy
 nipyapi_test/
 ├── .env.example              # Template — copy to .env and fill in your credentials
 ├── .gitignore                # Excludes .env, *.jar, __pycache__ from git
-├── requirements.txt          # Python dependencies
+├── requirements.txt          # Python dependencies (nipyapi pinned to 1.5.0)
 ├── deploy_flow_secure.py     # Main deploy script (with Snowflake secret support)
-├── deploy_flow.py            # Legacy deploy script (plain text secrets from .env)
 ├── README.md                 # This file
+├── archive/
+│   └── deploy_flow.py        # Legacy deploy script (plain text secrets) — not maintained
 └── flows/
     ├── sgope/
     │   ├── Snowflake-to-Postgres.json                    # Flow definition (no config)
@@ -29,9 +30,13 @@ nipyapi_test/
 - **Snowflake secret resolution** — passwords resolved from Snowflake SECRET objects via the runtime's Parameter Provider (`$SF_SECRET{DB.SCHEMA.SECRET}`)
 - **Asset uploads** — downloads JDBC drivers (or other JARs) and binds them to parameters
 - **Start/stop deployed flows** — enables/disables controller services automatically
+- **Delete deployed flows** — removes the process group and the parameter contexts only it used
+- **Fail-fast validation** — missing Snowflake secrets or stage files abort the deploy before anything is uploaded
+- **Automatic rollback** — if a deploy fails after upload, the partial process group is deleted
 - **List deployed flows** — see all flows on a runtime with their status
 - **Multi-runtime support** — list all runtimes, deploy to any by name with `--runtime`
 - **PrivateLink support** — toggle `USE_PRIVATELINK=true` for private connectivity
+- **Configurable runtime host prefix** — `OPENFLOW_HOST_PREFIX` for runtimes on `of2--`, `of3--`, etc.
 - **Local-first config** — loads config YAML from local disk first, falls back to GitHub
 
 ---
@@ -44,6 +49,7 @@ python deploy_flow_secure.py list-flows [--runtime NAME]                        
 python deploy_flow_secure.py deploy <bucket> <flow> [--runtime NAME] [--start]      # Deploy a flow
 python deploy_flow_secure.py start "<flow-name>" [--runtime NAME]                   # Start a deployed flow
 python deploy_flow_secure.py stop "<flow-name>" [--runtime NAME]                    # Stop a deployed flow
+python deploy_flow_secure.py delete "<flow-name>" [--runtime NAME] [--yes]          # Delete a flow + its parameter contexts
 ```
 
 ---
@@ -72,7 +78,7 @@ ALTER USER <your_user> ADD PROGRAMMATIC ACCESS TOKEN NIFI_DEPLOY_PAT
   DAYS_TO_EXPIRY = 365
   COMMENT = 'PAT for NiFi deploy script';
 ```
-Copy the token value (starts with `ver:1:...`) from the output.
+Copy the `token_secret` value from the output — it is only shown once.
 
 ### Step 3: Set Up Network Policy (Required for PAT Access)
 
@@ -123,11 +129,14 @@ GITHUB_FLOWS_PATH=flows
 # --- Snowflake ---
 SNOWFLAKE_ACCOUNT=sfsenorthamerica-sgope_aws3
 SNOWFLAKE_USER=sgope
-SNOWFLAKE_PAT=ver:1:your_snowflake_pat_here
+SNOWFLAKE_PAT=your_snowflake_pat_token_secret_here
 SNOWFLAKE_ROLE=ACCOUNTADMIN
 
 # --- OpenFlow Runtime (default — can be overridden with --runtime flag) ---
 OPENFLOW_RUNTIME=POSTGRES_DEMO
+
+# Host prefix of the runtime URL (default: of1) — see "Finding your host prefix" below
+# OPENFLOW_HOST_PREFIX=of2
 
 # --- Private Link (optional) ---
 # USE_PRIVATELINK=true
@@ -141,10 +150,31 @@ OPENFLOW_RUNTIME=POSTGRES_DEMO
 | `GITHUB_FLOWS_PATH` | No | Base directory in the repo where flows live (default: `flows`) |
 | `SNOWFLAKE_ACCOUNT` | Yes | Snowflake account identifier (e.g. `sfsenorthamerica-sgope_aws3`) |
 | `SNOWFLAKE_USER` | Yes | Snowflake username |
-| `SNOWFLAKE_PAT` | Yes | Snowflake Programmatic Access Token (starts with `ver:1:`) |
+| `SNOWFLAKE_PAT` | Yes | Snowflake Programmatic Access Token (the `token_secret` value) |
 | `SNOWFLAKE_ROLE` | No | Role for Snowflake operations (default: `OPENFLOW_ADMIN`) |
 | `OPENFLOW_RUNTIME` | No | Default runtime name (can be overridden with `--runtime`) |
+| `OPENFLOW_HOST_PREFIX` | No | Prefix of the runtime host, e.g. `of1`, `of2` (default: `of1`) |
 | `USE_PRIVATELINK` | No | Set to `true` for PrivateLink accounts |
+
+### Finding your host prefix
+
+The script builds the runtime URL as:
+
+```
+https://<OPENFLOW_HOST_PREFIX>--<org>-<account>.snowflakecomputing.app/<runtime-key>/nifi-api
+```
+
+Open the runtime in Snowsight and look at its URL. If it starts with `of2--`, set `OPENFLOW_HOST_PREFIX=of2`. A wrong prefix shows up as `401 Unauthorized` with `Token introspection returned no principal`, even though the PAT is valid.
+
+To check the endpoint and PAT outside the script:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" \
+  -H "Authorization: Bearer $SNOWFLAKE_PAT" \
+  https://of1--<org>-<account>.snowflakecomputing.app/<runtime-key>/nifi-api/flow/process-groups/root
+```
+
+`200` = endpoint and auth OK; `401` = token, role, or wrong host prefix; `403` = role lacks access to the runtime.
 
 ---
 
@@ -214,6 +244,17 @@ python deploy_flow_secure.py stop "SQLServer-Tuncate-Insert"
 python deploy_flow_secure.py stop "SQLServer-Tuncate-Insert" --runtime SQL_API_TEST
 ```
 
+### Delete a Deployed Flow
+
+Stops the flow, disables its controller services, empties queued FlowFiles, deletes the process group, then deletes the parameter contexts that only this flow used (including uploaded assets in them). It asks for confirmation unless `--yes` is passed. If several process groups share the name, all of them are deleted.
+
+```bash
+python deploy_flow_secure.py delete "SQLServer-Tuncate-Insert" --runtime SQL_API_TEST
+python deploy_flow_secure.py delete "SQLServer-Tuncate-Insert" --runtime SQL_API_TEST --yes
+```
+
+Parameter contexts are **kept** when they are managed by the Parameter Provider (e.g. `OPENFLOW.OPENFLOW`) or still bound to another process group. Each context is reported as deleted or kept.
+
 ---
 
 ## Config YAML (Parameters and Assets)
@@ -270,12 +311,27 @@ How it works:
 3. The script rewires the controller service property to reference `#{SECRET_NAME}` directly
 4. The flow's parameter context inherits from the Parameter Provider context
 
+If a referenced secret or schema isn't visible to the Parameter Provider, the deploy stops **before** the flow is uploaded and lists what is missing. Check that the SECRET exists and that the runtime's execute-as role has READ on it and USAGE on its database and schema.
+
 ### Assets
 
-Assets (e.g. JDBC driver JARs) are:
-1. Downloaded from the URL specified in the config
-2. Uploaded to the NiFi parameter context
-3. Bound to the specified parameter
+Each asset needs a `name`, a `parameter`, and either a `url` or a `stage`:
+
+```yaml
+assets:
+  - name: "mssql-jdbc-12.8.1.jre11.jar"
+    url: "https://repo1.maven.org/maven2/.../mssql-jdbc-12.8.1.jre11.jar"
+    parameter: "SQLServer JDBC Driver"
+  - name: "kafka-keystore.jks"
+    stage: "MY_DB.MY_SCHEMA.MY_STAGE/certs"      # file is read from @MY_DB.MY_SCHEMA.MY_STAGE/certs/kafka-keystore.jks
+    parameter: "Keystore Filename"
+```
+
+Assets are:
+1. Validated before deploy — stage files are checked with `LIST`; a missing file or incomplete entry stops the deploy
+2. Downloaded from the URL or Snowflake stage
+3. Uploaded to the NiFi parameter context
+4. Bound to the specified parameter (the deploy fails if the parameter doesn't exist in the flow)
 
 If the asset already exists on the runtime, the upload is skipped (idempotent).
 
@@ -286,16 +342,19 @@ If the asset already exists on the runtime, the upload is skipped (idempotent).
 ```
 Step 1:  Connect to Snowflake, discover runtime by name (SHOW OPENFLOW RUNTIMES IN ACCOUNT)
 Step 2:  Build runtime URL from account locator + runtime key
-Step 3:  Download flow JSON from GitHub
+Step 3:  Load flow JSON (local file first, then GitHub)
 Step 4:  Load config YAML (local file first, then GitHub; optional)
-Step 5:  Resolve $SF_SECRET{...} via Parameter Provider (fetch, apply, wire inheritance)
-Step 6:  Upload flow to runtime via nipyapi (NiFi REST API)
-Step 7:  Add inherited parameter contexts from Parameter Provider
-Step 8:  Apply parameters across all parameter contexts
-Step 9:  Rewire controller service properties to reference Snowflake secrets directly
-Step 10: Download and upload assets, bind to parameters
-Step 11: Optionally start the flow (enable CS + start processors)
+Step 5:  Validate assets (stage files exist, entries complete)            -- fails before upload
+Step 6:  Resolve $SF_SECRET{...} via Parameter Provider (all must exist)  -- fails before upload
+Step 7:  Upload flow to runtime via nipyapi (NiFi REST API)
+Step 8:  Add inherited parameter contexts from Parameter Provider
+Step 9:  Apply parameters across all parameter contexts
+Step 10: Rewire controller service properties to reference Snowflake secrets directly
+Step 11: Download and upload assets, bind to parameters
+Step 12: Optionally start the flow (enable CS + start processors)
 ```
+
+If any of steps 8-12 fails, the script **rolls back**: it deletes the new process group and the parameter contexts only it used (same logic as `delete`), then exits with the original error. If the rollback itself fails, the process group ID is printed so it can be removed manually.
 
 ## Troubleshooting
 
@@ -303,7 +362,8 @@ Step 11: Optionally start the flow (enable CS + start processors)
 |---|---|---|
 | `404 Not Found` from GitHub | Wrong bucket/flow name or branch | Check file path and case sensitivity (GitHub is case-sensitive) |
 | `401 Network policy is required` | No network policy set for PAT access | Create a network policy with your IP (see Step 3) |
-| `401 Bearer Token malformed` | Wrong PAT format in `.env` | Use a Snowflake PAT starting with `ver:1:...`, not a JWT |
+| `401 Bearer Token malformed` | Wrong value in `SNOWFLAKE_PAT` | Use the PAT `token_secret`; check for stray quotes or line breaks in `.env` |
+| `401 Unauthorized` — `Token introspection returned no principal` | Wrong runtime host prefix (e.g. runtime is on `of2--`) | Set `OPENFLOW_HOST_PREFIX` in `.env` (see "Finding your host prefix") |
 | `401 Unauthorized` | PAT expired or invalid | Regenerate the Snowflake PAT |
 | `403 Forbidden` on runtime | PAT role doesn't have access | Check role grants or use `--runtime` to target a different runtime |
 | `Connection refused` | Runtime is suspended | Resume: `ALTER OPENFLOW RUNTIME <db>.<schema>.<name> RESUME` |
@@ -311,3 +371,7 @@ Step 11: Optionally start the flow (enable CS + start processors)
 | `Role not granted` | PAT's `ROLE_RESTRICTION` doesn't match `SNOWFLAKE_ROLE` | Change `SNOWFLAKE_ROLE` in `.env` or create a new PAT with the right role |
 | `Login failed` on DB connection | Password incorrect or overwritten | Check Snowflake SECRET value; ensure asset binding doesn't overwrite sensitive params |
 | `Parameter Provider not found` | Runtime doesn't have the Snowflake Parameter Provider | Verify the runtime has "Openflow - Snowflake Parameter Provider" enabled |
+| `Snowflake secret(s) not found via Parameter Provider` | Secret doesn't exist or execute-as role can't read it | Create the SECRET, or grant READ on it and USAGE on its database/schema to the runtime's execute-as role |
+| `Asset validation failed` | Stage file missing, stage not accessible, or asset entry incomplete | Check `LIST @<stage>` and the `name`/`parameter`/`url`/`stage` fields in the config |
+| `'FlowApi' object has no attribute 'get_flow'` | Different nipyapi version installed | `pip install -r requirements.txt` (pins `nipyapi==1.5.0`) |
+| `ROLLBACK FAILED` | Cleanup after a failed deploy hit an error | Delete the printed process group ID in the canvas or with the `delete` command |
