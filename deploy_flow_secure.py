@@ -45,8 +45,9 @@ _PGConfigEntity.parameter_sensitivities = _PGConfigEntity.parameter_sensitivitie
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
-GITHUB_PAT = os.environ["GITHUB_PAT"].strip()
-GITHUB_REPO = os.environ["GITHUB_REPO"].strip()
+# GitHub is optional — only used as a fallback when a flow/config file isn't found locally
+GITHUB_PAT = os.environ.get("GITHUB_PAT", "").strip()
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip()
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip()
 GITHUB_FLOWS_PATH = os.environ.get("GITHUB_FLOWS_PATH", "flows").strip()
 
@@ -59,7 +60,9 @@ USE_PRIVATELINK = os.environ.get("USE_PRIVATELINK", "false").strip().lower() == 
 # Host prefix of the OpenFlow runtime URL (e.g. of1, of2) — check the runtime URL in Snowsight
 OPENFLOW_HOST_PREFIX = os.environ.get("OPENFLOW_HOST_PREFIX", "of1").strip().lower()
 
-GITHUB_HEADERS = {"Authorization": "Bearer " + GITHUB_PAT, "Accept": "application/vnd.github.v3+json"}
+GITHUB_HEADERS = {"Accept": "application/vnd.github.v3+json"}
+if GITHUB_PAT:  # not needed for public repos
+    GITHUB_HEADERS["Authorization"] = "Bearer " + GITHUB_PAT
 
 
 # ──────────────────────────────────────────────
@@ -150,6 +153,9 @@ def download_flow(bucket, flow_name):
         return flow_json
 
     # Fall back to GitHub
+    if not GITHUB_REPO:
+        raise FileNotFoundError("Flow file not found locally at %s, and GITHUB_REPO is not set for a GitHub fallback"
+                                % local_path)
     print("Downloading flow (GitHub): %s (branch: %s)" % (rel_path, GITHUB_BRANCH))
     flow_json = json.loads(_download_github_file(rel_path))
     print("Downloaded flow: %s" % flow_json.get("flowContents", {}).get("name", flow_name))
@@ -174,6 +180,9 @@ def download_config(bucket, flow_name):
         return config
 
     # Fall back to GitHub
+    if not GITHUB_REPO:
+        print("No local config at %s and GITHUB_REPO not set — skipping parameters/assets" % local_path)
+        return None
     path = "%s/%s/%s" % (GITHUB_FLOWS_PATH.strip("/"), bucket, config_filename)
     try:
         print("Looking for config (GitHub): %s" % path)

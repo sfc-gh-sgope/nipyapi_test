@@ -61,7 +61,7 @@ python deploy_flow_secure.py delete "<flow-name>" [--runtime NAME] [--yes]      
 - Python 3.9+
 - A GitHub repo with NiFi flow JSON files under `flows/<bucket>/`
 - One or more Snowflake OpenFlow runtimes (gen2)
-- A GitHub Personal Access Token (PAT) with repo read access
+- (Optional) A GitHub Personal Access Token (PAT) with repo read access — only if flows should be pulled from GitHub
 - A Snowflake Programmatic Access Token (PAT)
 
 ### Step 2: Generate Tokens
@@ -144,8 +144,8 @@ OPENFLOW_RUNTIME=POSTGRES_DEMO
 
 | Variable | Required | Description |
 |---|---|---|
-| `GITHUB_PAT` | Yes | GitHub Personal Access Token (starts with `ghp_`) |
-| `GITHUB_REPO` | Yes | GitHub repo in `owner/repo` format |
+| `GITHUB_PAT` | No | GitHub Personal Access Token (starts with `ghp_`); not needed for public repos |
+| `GITHUB_REPO` | No | GitHub repo in `owner/repo` format. Only used as a fallback when a flow/config file isn't found locally; leave unset to deploy from local files only |
 | `GITHUB_BRANCH` | No | Branch to pull flows from (default: `main`) |
 | `GITHUB_FLOWS_PATH` | No | Base directory in the repo where flows live (default: `flows`) |
 | `SNOWFLAKE_ACCOUNT` | Yes | Snowflake account identifier (e.g. `sfsenorthamerica-sgope_aws3`) |
