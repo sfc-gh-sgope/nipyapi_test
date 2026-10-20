@@ -1,4 +1,4 @@
-nipyapi
+nipyapi==1.5.0
 requests
 python-dotenv
 snowflake-connector-python

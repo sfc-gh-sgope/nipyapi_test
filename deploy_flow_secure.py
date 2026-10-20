@@ -9,6 +9,7 @@ Usage:
     python deploy_flow_secure.py deploy <bucket> <flow-name>
     python deploy_flow_secure.py list-runtimes
     python deploy_flow_secure.py list-flows
+    python deploy_flow_secure.py delete <flow-name> [--runtime NAME] [--yes]
 
 Example:
     python deploy_flow_secure.py deploy sgope SQLServer-Tuncate-Insert
@@ -228,8 +229,24 @@ def _apply_parameter_provider(provider_id, target_groups, requested_secrets=None
     groups = pp.component.parameter_group_configurations or []
 
     if not groups:
-        print("  WARNING: No parameter groups found after fetch", file=sys.stderr)
-        return []
+        raise RuntimeError("No parameter groups returned by the Parameter Provider — cannot resolve secrets %s" % (
+            ", ".join(sorted(target_groups))))
+
+    # Fail before applying anything if a referenced schema or secret isn't visible to the runtime
+    available = {g.group_name: set((g.parameter_sensitivities or {}).keys()) for g in groups}
+    errors = []
+    for group_key in sorted(target_groups):
+        if group_key not in available:
+            errors.append("schema %s not found (available: %s)" % (group_key, ", ".join(sorted(available)) or "none"))
+            continue
+        for secret_name in sorted((requested_secrets or {}).get(group_key, set())):
+            if secret_name not in available[group_key]:
+                errors.append("secret %s.%s not found" % (group_key, secret_name))
+    if errors:
+        raise RuntimeError(
+            "Snowflake secret(s) not found via Parameter Provider:\n  - %s\n"
+            "Check that the SECRET exists and the runtime's execute-as role has READ on it "
+            "and USAGE on its database/schema." % "\n  - ".join(errors))
 
     for group in groups:
         group_key = group.group_name
@@ -437,6 +454,110 @@ def deploy_flow_to_runtime(root_pg_id, flow_json, flow_name=None):
     return pg_id
 
 
+def _nifi_headers():
+    return {"Content-Type": "application/json", "Authorization": "Bearer " + SNOWFLAKE_PAT}
+
+
+def _collect_flow_context_ids(pg_id):
+    """Parameter contexts bound to a process group or its descendants, plus everything they inherit."""
+    base, headers = nipyapi.config.nifi_config.host, _nifi_headers()
+    ctx_ids, stack = set(), [pg_id]
+    while stack:
+        resp = requests.get("%s/flow/process-groups/%s" % (base, stack.pop()), headers=headers, timeout=30)
+        resp.raise_for_status()
+        flow = resp.json()["processGroupFlow"]
+        if flow.get("parameterContext"):
+            ctx_ids.add(flow["parameterContext"]["id"])
+        stack.extend(child["id"] for child in flow["flow"].get("processGroups", []))
+    queue = list(ctx_ids)
+    while queue:
+        resp = requests.get("%s/parameter-contexts/%s" % (base, queue.pop()), headers=headers, timeout=30)
+        resp.raise_for_status()
+        for inherited in resp.json()["component"].get("inheritedParameterContexts") or []:
+            if inherited["id"] not in ctx_ids:
+                ctx_ids.add(inherited["id"])
+                queue.append(inherited["id"])
+    return ctx_ids
+
+
+def _delete_parameter_contexts(ctx_ids):
+    """Delete contexts that are no longer used. Provider-managed or still-bound contexts are kept.
+
+    Contexts can inherit from each other, so retry until no more can be removed.
+    """
+    base, headers = nipyapi.config.nifi_config.host, _nifi_headers()
+    remaining, progress = set(ctx_ids), True
+    while remaining and progress:
+        progress = False
+        for ctx_id in sorted(remaining):
+            resp = requests.get("%s/parameter-contexts/%s" % (base, ctx_id), headers=headers, timeout=30)
+            if resp.status_code == 404:
+                remaining.discard(ctx_id)
+                progress = True
+                continue
+            resp.raise_for_status()
+            ctx = resp.json()
+            name = ctx["component"]["name"]
+            if ctx["component"].get("parameterProviderConfiguration"):
+                print("  Kept parameter context '%s' (managed by Parameter Provider)" % name)
+            elif ctx["component"].get("boundProcessGroups"):
+                print("  Kept parameter context '%s' (still used by %d other process group(s))" % (
+                    name, len(ctx["component"]["boundProcessGroups"])))
+            else:
+                d = requests.delete("%s/parameter-contexts/%s" % (base, ctx_id),
+                                    params={"version": ctx["revision"]["version"], "clientId": str(uuid.uuid4())},
+                                    headers=headers, timeout=30)
+                if not d.ok:
+                    continue  # probably inherited by another context still in the set; retry next pass
+                print("  Deleted parameter context '%s'" % name)
+            remaining.discard(ctx_id)
+            progress = True
+    for ctx_id in remaining:
+        print("  WARNING: could not delete parameter context %s (inherited by a context outside this flow?)" % ctx_id,
+              file=sys.stderr)
+
+
+def delete_flow(pg_id):
+    """Stop, empty, and delete a process group, then delete the parameter contexts only it used."""
+    base, headers = nipyapi.config.nifi_config.host, _nifi_headers()
+    ctx_ids = _collect_flow_context_ids(pg_id)
+
+    requests.put("%s/flow/process-groups/%s" % (base, pg_id),
+                 data=json.dumps({"id": pg_id, "state": "STOPPED"}), headers=headers, timeout=30).raise_for_status()
+    requests.put("%s/flow/process-groups/%s/controller-services" % (base, pg_id),
+                 data=json.dumps({"id": pg_id, "state": "DISABLED"}), headers=headers, timeout=30).raise_for_status()
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        resp = requests.get("%s/flow/process-groups/%s/controller-services" % (base, pg_id),
+                            params={"includeAncestorGroups": "false", "includeDescendantGroups": "true"},
+                            headers=headers, timeout=30)
+        resp.raise_for_status()
+        if all(cs["component"]["state"] == "DISABLED" for cs in resp.json().get("controllerServices", [])):
+            break
+        time.sleep(2)
+    else:
+        raise RuntimeError("Timed out waiting for controller services in %s to disable" % pg_id)
+
+    # Queued FlowFiles block deletion, so drop them first
+    resp = requests.post("%s/process-groups/%s/empty-all-connections-requests" % (base, pg_id),
+                         headers=headers, timeout=30)
+    resp.raise_for_status()
+    drop_id = resp.json()["dropRequest"]["id"]
+    drop_url = "%s/process-groups/%s/empty-all-connections-requests/%s" % (base, pg_id, drop_id)
+    while not requests.get(drop_url, headers=headers, timeout=30).json()["dropRequest"]["finished"]:
+        time.sleep(1)
+    requests.delete(drop_url, headers=headers, timeout=30)
+
+    pg = requests.get("%s/process-groups/%s" % (base, pg_id), headers=headers, timeout=30)
+    pg.raise_for_status()
+    requests.delete("%s/process-groups/%s" % (base, pg_id),
+                    params={"version": pg.json()["revision"]["version"], "clientId": str(uuid.uuid4())},
+                    headers=headers, timeout=30).raise_for_status()
+    print("  Deleted process group %s" % pg_id)
+
+    _delete_parameter_contexts(ctx_ids)
+
+
 # ──────────────────────────────────────────────
 # 7. Apply parameters from config.yaml
 # ──────────────────────────────────────────────
@@ -625,6 +746,46 @@ def _download_from_stage(stage_path, filename):
         conn.close()
 
 
+def validate_stage_assets(assets_list):
+    """Fail before deploying if any asset definition is incomplete or its stage file is missing."""
+    if not assets_list:
+        return
+    errors = []
+    stage_assets = []
+    for asset_def in assets_list:
+        name = asset_def.get("name", "")
+        if not name or not asset_def.get("parameter"):
+            errors.append("asset %r is missing 'name' or 'parameter'" % (name or asset_def))
+        elif asset_def.get("stage"):
+            stage_assets.append(asset_def)
+        elif not asset_def.get("url"):
+            errors.append("asset '%s' has no 'url' or 'stage'" % name)
+
+    if stage_assets:
+        print("\nValidating %d stage asset(s)..." % len(stage_assets))
+        conn = _get_snowflake_connection()
+        cur = conn.cursor()
+        try:
+            for asset_def in stage_assets:
+                stage_path, name = asset_def["stage"].rstrip("/"), asset_def["name"]
+                try:
+                    cur.execute("LIST @%s/%s" % (stage_path, name))
+                    files = [row[0] for row in cur.fetchall()]
+                except snowflake.connector.errors.ProgrammingError as e:
+                    errors.append("stage @%s not accessible: %s" % (stage_path, e.msg))
+                    continue
+                if not any(f.rsplit("/", 1)[-1] in (name, name + ".gz") for f in files):
+                    errors.append("file '%s' not found in stage @%s" % (name, stage_path))
+                else:
+                    print("  Found @%s/%s" % (stage_path, name))
+        finally:
+            cur.close()
+            conn.close()
+
+    if errors:
+        raise RuntimeError("Asset validation failed:\n  - %s" % "\n  - ".join(errors))
+
+
 def upload_assets(pg_id, assets_list):
     if not assets_list:
         return
@@ -653,8 +814,8 @@ def upload_assets(pg_id, assets_list):
         asset_url = asset_def.get("url", "")
         asset_stage = asset_def.get("stage", "")
         if asset_param not in param_map:
-            print("  WARNING: Parameter '%s' not found — skipping '%s'" % (asset_param, asset_name), file=sys.stderr)
-            continue
+            raise RuntimeError("Parameter '%s' for asset '%s' not found in the flow's parameter contexts" % (
+                asset_param, asset_name))
         ctx_id, _ = param_map[asset_param]
         existing = {ae.asset.name: ae.asset for ae in (pc_api.get_assets(context_id=ctx_id).assets or [])}
         if asset_name in existing and not existing[asset_name].missing_content:
@@ -672,8 +833,7 @@ def upload_assets(pg_id, assets_list):
                 resp.raise_for_status()
                 asset_bytes = resp.content
             else:
-                print("  WARNING: No 'url' or 'stage' for asset '%s' — skipping" % asset_name, file=sys.stderr)
-                continue
+                raise RuntimeError("No 'url' or 'stage' for asset '%s'" % asset_name)
             print("  Uploading to parameter context (%d bytes)..." % len(asset_bytes))
             upload_result = pc_api.create_asset(body=asset_bytes, context_id=ctx_id, filename=asset_name)
             asset_id = upload_result.asset.id
@@ -835,6 +995,25 @@ def cmd_stop(args):
     _disable_controller_services(pg.id)
     print("Flow stopped.")
 
+def cmd_delete(args):
+    _connect_to_named_runtime(_get_runtime_name(args))
+    matches = [pg for pg in _get_root_process_groups() if pg.component.name == args.flow_name]
+    if not matches:
+        print("ERROR: Flow '%s' not found." % args.flow_name, file=sys.stderr)
+        sys.exit(1)
+    print("\nWill delete %d process group(s) named '%s' and their unused parameter contexts:" % (
+        len(matches), args.flow_name))
+    for pg in matches:
+        print("  %s" % pg.id)
+    if not args.yes and input("Type 'yes' to confirm: ").strip().lower() != "yes":
+        print("Aborted.")
+        return
+    for pg in matches:
+        print("\nDeleting %s..." % pg.id)
+        delete_flow(pg.id)
+    print("\nDone.")
+
+
 def cmd_deploy(args):
     runtime_name = _get_runtime_name(args)
 
@@ -849,6 +1028,10 @@ def cmd_deploy(args):
     if not args.skip_config:
         flow_config = download_config(args.bucket, args.flow)
 
+    # Step 3b: Validate assets before touching the runtime
+    if flow_config and flow_config.get("assets"):
+        validate_stage_assets(flow_config["assets"])
+
     # Step 4: Connect to runtime
     root_pg_id = connect_to_runtime(runtime_url)
 
@@ -861,28 +1044,38 @@ def cmd_deploy(args):
     # Step 6: Deploy flow
     pg_id = deploy_flow_to_runtime(root_pg_id, flow_json, flow_name=args.name)
 
-    # Step 7: Add inherited parameter contexts (from Parameter Provider)
-    if contexts_to_inherit:
-        print("\nWiring inherited parameter contexts...")
-        add_inherited_contexts(pg_id, contexts_to_inherit)
+    try:
+        # Step 7: Add inherited parameter contexts (from Parameter Provider)
+        if contexts_to_inherit:
+            print("\nWiring inherited parameter contexts...")
+            add_inherited_contexts(pg_id, contexts_to_inherit)
 
-    # Step 8: Apply parameters (SF_SECRET params excluded — handled via rewiring)
-    if flow_config and flow_config.get("parameters"):
-        apply_parameters(pg_id, flow_config["parameters"])
+        # Step 8: Apply parameters (SF_SECRET params excluded — handled via rewiring)
+        if flow_config and flow_config.get("parameters"):
+            apply_parameters(pg_id, flow_config["parameters"])
 
-    # Step 8b: Rewire controller service properties to reference Snowflake secrets directly
-    if rewire_map:
-        rewire_controller_services(pg_id, rewire_map)
+        # Step 8b: Rewire controller service properties to reference Snowflake secrets directly
+        if rewire_map:
+            rewire_controller_services(pg_id, rewire_map)
 
-    # Step 9: Upload assets
-    if flow_config and flow_config.get("assets"):
-        upload_assets(pg_id, flow_config["assets"])
+        # Step 9: Upload assets
+        if flow_config and flow_config.get("assets"):
+            upload_assets(pg_id, flow_config["assets"])
 
-    # Step 10: Start the flow
-    if args.start:
-        print("\nStarting flow...")
-        nipyapi.canvas.schedule_process_group(pg_id, True)
-        print("Flow started.")
+        # Step 10: Start the flow
+        if args.start:
+            print("\nStarting flow...")
+            nipyapi.canvas.schedule_process_group(pg_id, True)
+            print("Flow started.")
+    except Exception as e:
+        # Roll back so a failed deploy doesn't leave a half-configured flow behind
+        print("\nDeploy failed: %s" % e, file=sys.stderr)
+        print("Rolling back process group %s..." % pg_id, file=sys.stderr)
+        try:
+            delete_flow(pg_id)
+        except Exception as rollback_err:
+            print("ROLLBACK FAILED: %s — delete process group %s manually" % (rollback_err, pg_id), file=sys.stderr)
+        raise
 
     print("\nDone! Process group ID: %s" % pg_id)
 
@@ -912,6 +1105,11 @@ if __name__ == "__main__":
     stp.add_argument("flow_name")
     stp.add_argument("--runtime", default=None)
 
+    dl = subparsers.add_parser("delete", help="Delete a deployed flow and its parameter contexts")
+    dl.add_argument("flow_name")
+    dl.add_argument("--runtime", default=None)
+    dl.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -919,7 +1117,8 @@ if __name__ == "__main__":
 
     try:
         {"list-runtimes": cmd_list_runtimes, "list-flows": cmd_list_flows,
-         "deploy": cmd_deploy, "start": cmd_start, "stop": cmd_stop}[args.command](args)
+         "deploy": cmd_deploy, "start": cmd_start, "stop": cmd_stop,
+         "delete": cmd_delete}[args.command](args)
     except requests.HTTPError as e:
         print("API error: %s" % e, file=sys.stderr)
         sys.exit(1)
