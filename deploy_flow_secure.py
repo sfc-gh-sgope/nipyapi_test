@@ -55,6 +55,8 @@ SNOWFLAKE_PAT = os.environ["SNOWFLAKE_PAT"].strip()
 SNOWFLAKE_ROLE = os.environ.get("SNOWFLAKE_ROLE", "OPENFLOW_ADMIN").strip()
 OPENFLOW_RUNTIME = os.environ.get("OPENFLOW_RUNTIME", "").strip()
 USE_PRIVATELINK = os.environ.get("USE_PRIVATELINK", "false").strip().lower() == "true"
+# Host prefix of the OpenFlow runtime URL (e.g. of1, of2) — check the runtime URL in Snowsight
+OPENFLOW_HOST_PREFIX = os.environ.get("OPENFLOW_HOST_PREFIX", "of1").strip().lower()
 
 GITHUB_HEADERS = {"Authorization": "Bearer " + GITHUB_PAT, "Accept": "application/vnd.github.v3+json"}
 
@@ -80,7 +82,7 @@ def _get_account_locator(cur):
 
 def _build_runtime_url(account_locator, runtime_key):
     domain = "privatelink.snowflakecomputing.app" if USE_PRIVATELINK else "snowflakecomputing.app"
-    return "https://of1--%s.%s/%s" % (account_locator, domain, runtime_key)
+    return "https://%s--%s.%s/%s" % (OPENFLOW_HOST_PREFIX, account_locator, domain, runtime_key)
 
 
 def get_all_runtimes():
@@ -405,8 +407,10 @@ def add_inherited_contexts(pg_id, context_names):
 
 def connect_to_runtime(runtime_url):
     base = re.sub(r"/nifi-api/?$", "", re.sub(r"/nifi/?$", "", runtime_url.rstrip("/")))
-    nipyapi.config.nifi_config.host = base + "/nifi-api"
+    nifi_api_url = base + "/nifi-api"
+    nipyapi.config.nifi_config.host = nifi_api_url
     nipyapi.security.set_service_auth_token(service="nifi", token=SNOWFLAKE_PAT)
+    print("NiFi API endpoint: %s" % nifi_api_url)
     root_pg_id = nipyapi.canvas.get_root_pg_id()
     print("Connected to runtime. Root process group: %s" % root_pg_id)
     return root_pg_id
